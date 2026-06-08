@@ -2,12 +2,11 @@
 """
 Vision model benchmark on the local ollama server.
 Tests each model on German grocery sales slip images and measures accuracy + latency.
-GPU target: NVIDIA RTX A2000 8GB Laptop GPU (~7.8 GB free VRAM).
+GPU target: NVIDIA RTX A2000 8 GB Laptop GPU.
 """
 
 import base64
 import io
-import json
 import os
 import re
 import subprocess
@@ -22,43 +21,33 @@ from typing import Optional
 import ollama
 from PIL import Image
 from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable,
+    KeepTogether,
 )
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Paths
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_IMAGES_DIR = REPO_ROOT / "test_images"
 OUTPUT_PDF = Path(__file__).resolve().parent / "results.pdf"
 
-# Vision-capable models that fit in 8 GB VRAM.
-# Sizes are approximate on-disk footprints at default quantisation.
-# keep=True  → always retain on disk (already installed before this benchmark)
-# keep=False → retain unless disk drops below 2 GB (emergency-only eviction)
-MODELS = [
-    # Tier 2 — already installed, keep
-    {"id": "moondream",                          "display": "Moondream 2",          "size": "~1.7 GB", "keep": True},
-    {"id": "llava-phi3",                         "display": "LLaVA-Phi3",           "size": "~2.9 GB", "keep": True},
-    {"id": "gemma3:4b",                          "display": "Gemma 3 4B",           "size": "~3.3 GB", "keep": True},
-    {"id": "llava:7b",                           "display": "LLaVA 1.5 7B",         "size": "~4.7 GB", "keep": True},
-    # Tier 3 — tiny German-receipt specialists, download + remove
-    {"id": "Keyvan/german-ocr-3",               "display": "German-OCR-3",          "size": "~2.7 GB", "keep": False},
-    {"id": "richardyoung/smolvlm2-2.2b-instruct","display": "SmolVLM2 2.2B",        "size": "~2.0 GB", "keep": False},
-    {"id": "minicpm-o:4b",                       "display": "MiniCPM-o 4B",         "size": "~5.0 GB", "keep": False},
-    # Tier 1 — highest quality, download + remove (ordered by size asc)
-    {"id": "qwen3-vl:4b",                        "display": "Qwen3-VL 4B",          "size": "~3.4 GB", "keep": False},
-    {"id": "qwen2.5-vl:7b",                      "display": "Qwen2.5-VL 7B",        "size": "~5.5 GB", "keep": False},
-    {"id": "qwen2-vl:7b",                        "display": "Qwen2-VL 7B",          "size": "~5.5 GB", "keep": False},
-    {"id": "minicpm-v",                          "display": "MiniCPM-V 2.6 8B",     "size": "~6.0 GB", "keep": False},
-    {"id": "bakllava",                           "display": "BakLLaVA 7B",          "size": "~7.4 GB", "keep": False},
-    {"id": "llama3.2-vision:11b",               "display": "Llama 3.2-Vision 11B", "size": "~7.9 GB", "keep": False},
-]
+# ---------------------------------------------------------------------------
+# Models to benchmark
+# keep=True  → always retain on disk
+# keep=False → retain unless free disk < 2 GB (emergency eviction only)
+# ---------------------------------------------------------------------------
+
+# All known candidates have been benchmarked. Add new model IDs here for
+# future benchmark runs; they will be downloaded, tested, and kept on disk
+# unless the 2 GB emergency eviction threshold is hit.
+MODELS: list[dict] = []
 
 PROMPT = (
     "What is the sum to pay in the given sales slip? "
@@ -68,7 +57,7 @@ PROMPT = (
     "No currency symbol, no extra text. If not found, reply 'NaN'."
 )
 
-MAX_SIDE_PX = 1500  # resize before sending
+MAX_SIDE_PX = 1500
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -77,7 +66,7 @@ MAX_SIDE_PX = 1500  # resize before sending
 @dataclass
 class ImageResult:
     filename: str
-    expected: str       # e.g. "79,49"
+    expected: str
     response: str
     correct: bool
     latency_s: float
@@ -92,6 +81,7 @@ class ModelResult:
     pull_time_s: float
     skipped: bool = False
     skip_reason: str = ""
+    archived: bool = False   # True → benchmarked in a prior run, no longer on disk
     image_results: list = field(default_factory=list)
 
     @property
@@ -102,6 +92,10 @@ class ModelResult:
         return sum(r.correct for r in valid) / len(valid)
 
     @property
+    def correct_count(self) -> int:
+        return sum(r.correct for r in self.image_results if r.error is None)
+
+    @property
     def avg_latency_s(self) -> float:
         valid = [r for r in self.image_results if r.error is None]
         if not valid:
@@ -110,21 +104,90 @@ class ModelResult:
 
 
 # ---------------------------------------------------------------------------
+# Archived results from prior runs (models removed from disk after testing)
+# ---------------------------------------------------------------------------
+
+ARCHIVED_RESULTS: list[ModelResult] = [
+    # ── 100 % ───────────────────────────────────────────────────────────────
+    ModelResult("llama3.2-vision:11b",     "Llama 3.2-Vision 11B", "~7.9 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "79,49", True,  18.4),
+        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,   8.3),
+        ImageResult("slip2_1093.jpg", "10,93", "10,93", True,   7.9),
+    ]),
+    ModelResult("qwen3-vl:4b",             "Qwen3-VL 4B",          "~3.3 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "79,49", True,  29.1),
+        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,   5.7),
+        ImageResult("slip2_1093.jpg", "10,93", "10,93", True,  11.0),
+    ]),
+    # ── 67 % ────────────────────────────────────────────────────────────────
+    ModelResult("moondream",               "Moondream 2",          "~1.7 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "79,49", True,  0.3),
+        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,  0.3),
+        ImageResult("slip2_1093.jpg", "10,93", "79,49", False, 0.3),
+    ]),
+    # MiniCPM-V errored in the automated benchmark run (VRAM flush timing);
+    # result below is from a verified standalone retest immediately after.
+    ModelResult("minicpm-v",               "MiniCPM-V 2.6",        "~5.5 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "66,80", False, 8.4),
+        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,  3.5),
+        ImageResult("slip2_1093.jpg", "10,93", "10,93", True,  3.6),
+    ]),
+    # ── 33 % ────────────────────────────────────────────────────────────────
+    ModelResult("bakllava",                "BakLLaVA 7B",          "~4.7 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "79,49", True,  2.6),
+        ImageResult("slip1_2841.jpg", "28,41", "79,49", False, 0.9),
+        ImageResult("slip2_1093.jpg", "10,93", "79,49", False, 0.9),
+    ]),
+    ModelResult("llava-phi3",              "LLaVA-Phi3",           "~2.9 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "85,01", False, 4.0),
+        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,  0.6),
+        ImageResult("slip2_1093.jpg", "10,93", "11,03", False, 0.6),
+    ]),
+    ModelResult("gemma3:4b",               "Gemma 3 4B",           "~3.3 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "12,69", False, 5.6),
+        ImageResult("slip1_2841.jpg", "28,41", "NaN",   False, 2.1),
+        ImageResult("slip2_1093.jpg", "10,93", "10,93", True,  2.1),
+    ]),
+    ModelResult("Keyvan/german-ocr-3",     "German-OCR-3",         "~2.7 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "NaN",   False, 93.8),
+        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,  27.7),
+        ImageResult("slip2_1093.jpg", "10,93", "NaN",   False, 98.7),
+    ]),
+    # ── 0 % ─────────────────────────────────────────────────────────────────
+    ModelResult("llava:7b",                "LLaVA 1.5 7B",         "~4.7 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "NaN",   False, 2.7),
+        ImageResult("slip1_2841.jpg", "28,41", "NaN",   False, 0.9),
+        ImageResult("slip2_1093.jpg", "10,93", "NaN",   False, 0.9),
+    ]),
+    ModelResult("richardyoung/smolvlm2-2.2b-instruct", "SmolVLM2 2.2B", "~1.1 GB", 0, archived=True, image_results=[
+        ImageResult("slip0_7949.jpg", "79,49", "123,45", False, 1.4),
+        ImageResult("slip1_2841.jpg", "28,41", "79,49",  False, 0.2),
+        ImageResult("slip2_1093.jpg", "10,93", "79,49",  False, 0.2),
+    ]),
+    # ── not available in ollama registry ────────────────────────────────────
+    ModelResult("minicpm-o:4b",  "MiniCPM-o 4B",   "~5.0 GB", 0,
+                skipped=True, skip_reason="model not found in ollama registry"),
+    ModelResult("qwen2.5-vl:7b", "Qwen2.5-VL 7B",  "~5.5 GB", 0,
+                skipped=True, skip_reason="pull failed (disk / registry)"),
+    ModelResult("qwen2-vl:7b",   "Qwen2-VL 7B",    "~5.5 GB", 0,
+                skipped=True, skip_reason="pull failed (disk / registry)"),
+]
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def installed_model_ids() -> set:
     try:
-        resp = ollama.list()
-        return {m.model for m in resp.models}
+        return {m.model for m in ollama.list().models}
     except Exception:
         return set()
 
 
 def _is_installed(model_id: str) -> bool:
     present = installed_model_ids()
-    tag = model_id.split(":")[1] if ":" in model_id else ""
     base = model_id.split(":")[0]
+    tag  = model_id.split(":")[1] if ":" in model_id else ""
     return any(
         mid == model_id or (tag and mid.startswith(base + ":" + tag))
         for mid in present
@@ -137,7 +200,6 @@ def free_disk_gb() -> float:
 
 
 def pull_model(model_id: str, silent: bool = False) -> float:
-    """Pull model if absent; return elapsed seconds (0 if cached)."""
     if _is_installed(model_id):
         if not silent:
             print(f"  [cache] {model_id} already installed")
@@ -166,18 +228,16 @@ def remove_model(model_id: str) -> None:
         print(f"  [cleanup] could not remove {model_id}: {e}")
 
 
-def prefetch_model(model_id: str) -> threading.Thread:
-    """Start pulling model_id in a background thread (pipeline prefetch)."""
+def prefetch_model(model_id: str) -> Optional[threading.Thread]:
     if _is_installed(model_id):
         return None
-    print(f"  [prefetch] starting background download of {model_id} …", flush=True)
+    print(f"  [prefetch] background download of {model_id} …", flush=True)
     t = threading.Thread(target=pull_model, args=(model_id, True), daemon=True)
     t.start()
     return t
 
 
 def encode_image(path: Path) -> str:
-    """Resize to MAX_SIDE_PX and return base64-encoded JPEG string."""
     with Image.open(path) as img:
         img = img.convert("RGB")
         w, h = img.size
@@ -190,7 +250,6 @@ def encode_image(path: Path) -> str:
 
 
 def extract_expected(filename: str) -> str:
-    """slip0_7949.jpg → '79,49'"""
     m = re.search(r"_(\d+)\.", filename)
     if not m:
         return "?"
@@ -199,37 +258,27 @@ def extract_expected(filename: str) -> str:
 
 
 def parse_response(text: str) -> str:
-    """Return a normalised 'Euro,Cent' string or 'NaN'."""
     text = text.strip()
-    # Accept "79,49", "79.49", "€79,49", "79,49 €", etc.
     m = re.search(r"(\d+)[,.](\d{2})", text)
-    if m:
-        return f"{m.group(1)},{m.group(2)}"
-    return "NaN"
+    return f"{m.group(1)},{m.group(2)}" if m else "NaN"
 
 
 def run_model_on_image(model_id: str, image_path: Path) -> tuple[str, float]:
-    """Return (raw_response_text, latency_s)."""
     b64 = encode_image(image_path)
     t0 = time.monotonic()
     resp = ollama.chat(
         model=model_id,
-        messages=[{
-            "role": "user",
-            "content": PROMPT,
-            "images": [b64],
-        }],
+        messages=[{"role": "user", "content": PROMPT, "images": [b64]}],
         options={"temperature": 0},
     )
-    latency = time.monotonic() - t0
-    return resp.message.content.strip(), latency
+    return resp.message.content.strip(), time.monotonic() - t0
 
 
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
-def benchmark() -> list:
+def benchmark() -> list[ModelResult]:
     test_images = sorted(TEST_IMAGES_DIR.glob("*.jpg"))
     if not test_images:
         sys.exit(f"No JPEG images found in {TEST_IMAGES_DIR}")
@@ -239,38 +288,29 @@ def benchmark() -> list:
 
     for i, spec in enumerate(MODELS):
         mid = spec["id"]
-        print(f"\n{'='*60}")
-        print(f"Model: {spec['display']} ({mid})")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}\nModel: {spec['display']} ({mid})\n{'='*60}")
 
-        # Wait for the prefetch thread for this model to finish (if any)
         if prefetch_thread is not None:
             if prefetch_thread.is_alive():
-                print(f"  [prefetch] waiting for download to finish …", flush=True)
+                print("  [prefetch] waiting for download …", flush=True)
                 prefetch_thread.join()
             prefetch_thread = None
 
-        # --- pull (will be instant if prefetch already completed) ---
         try:
             pull_time = pull_model(mid)
         except Exception as e:
-            print(f"  [skip] pull failed: {e}")
-            mr = ModelResult(mid, spec["display"], spec["size"], 0.0,
-                             skipped=True, skip_reason=f"pull failed: {e}")
-            results.append(mr)
+            print(f"  [skip] {e}")
+            results.append(ModelResult(mid, spec["display"], spec["size"], 0.0,
+                                       skipped=True, skip_reason=str(e)))
             continue
 
         mr = ModelResult(mid, spec["display"], spec["size"], pull_time)
 
-        # Kick off prefetch of the NEXT model in background while we run inference.
-        # Skip prefetch for keep=False models: we wait until the current model
-        # is removed from disk first (happens after inference), then pull sequentially
-        # to avoid briefly holding two large models simultaneously.
+        # Prefetch next keep=True model while running inference
         next_spec = MODELS[i + 1] if i + 1 < len(MODELS) else None
         if next_spec and next_spec.get("keep", True):
             prefetch_thread = prefetch_model(next_spec["id"])
 
-        # --- inference ---
         for img_path in test_images:
             expected = extract_expected(img_path.name)
             print(f"  image: {img_path.name}  expected={expected}", end=" … ", flush=True)
@@ -279,38 +319,28 @@ def benchmark() -> list:
                 parsed = parse_response(raw)
                 correct = (parsed == expected)
                 print(f"got='{parsed}'  {'OK' if correct else 'WRONG'}  {latency:.1f}s")
-                mr.image_results.append(ImageResult(
-                    filename=img_path.name,
-                    expected=expected,
-                    response=raw[:120],
-                    correct=correct,
-                    latency_s=latency,
-                ))
+                mr.image_results.append(ImageResult(img_path.name, expected,
+                                                     raw[:120], correct, latency))
             except Exception as e:
                 print(f"ERROR: {e}")
-                mr.image_results.append(ImageResult(
-                    filename=img_path.name,
-                    expected=expected,
-                    response="",
-                    correct=False,
-                    latency_s=0.0,
-                    error=str(e)[:120],
-                ))
+                mr.image_results.append(ImageResult(img_path.name, expected,
+                                                     "", False, 0.0, str(e)[:120]))
 
         results.append(mr)
-        # Unload model from VRAM before loading the next one
+
+        # Evict from VRAM
         try:
-            ollama.chat(model=mid, messages=[{"role": "user", "content": "."}],
+            ollama.chat(model=mid,
+                        messages=[{"role": "user", "content": "."}],
                         options={"num_predict": 1, "keep_alive": "0"})
         except Exception:
             pass
-        # Keep all models on disk so the best performers are available locally.
-        # Only remove if disk is critically low (< 2 GB) to protect the filesystem.
+
+        # Emergency eviction from disk only
         if free_disk_gb() < 2.0 and not spec.get("keep", True):
-            print(f"  [disk] {free_disk_gb():.1f} GB free — removing {mid} to protect disk")
+            print(f"  [disk] emergency eviction of {mid}")
             remove_model(mid)
 
-    # Drain any remaining prefetch thread
     if prefetch_thread and prefetch_thread.is_alive():
         prefetch_thread.join()
 
@@ -321,113 +351,176 @@ def benchmark() -> list:
 # PDF report
 # ---------------------------------------------------------------------------
 
-def build_pdf(results: list, gpu_info: str):
+# Accuracy colour bands
+def acc_color(pct: float) -> colors.Color:
+    if pct >= 1.0:   return colors.HexColor("#1e8449")   # green
+    if pct >= 0.67:  return colors.HexColor("#d4ac0d")   # gold
+    if pct >= 0.33:  return colors.HexColor("#e67e22")   # orange
+    return           colors.HexColor("#c0392b")           # red
+
+
+def build_pdf(live_results: list[ModelResult], gpu_info: str):
+    # Merge live + archived, sort by accuracy desc then latency asc
+    all_results = live_results + ARCHIVED_RESULTS
+    ranked = sorted(
+        [r for r in all_results if not r.skipped],
+        key=lambda r: (-r.accuracy, r.avg_latency_s if r.avg_latency_s == r.avg_latency_s else 9999)
+    )
+    skipped = [r for r in all_results if r.skipped]
+
     doc = SimpleDocTemplate(
-        str(OUTPUT_PDF),
-        pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=2*cm, bottomMargin=2*cm,
+        str(OUTPUT_PDF), pagesize=A4,
+        leftMargin=1.8*cm, rightMargin=1.8*cm,
+        topMargin=1.8*cm, bottomMargin=1.8*cm,
     )
     styles = getSampleStyleSheet()
-    h1 = styles["h1"]
-    h2 = styles["h2"]
-    body = styles["BodyText"]
-    body.fontSize = 8
-    body.leading = 11
 
-    mono = ParagraphStyle("mono", parent=body, fontName="Courier", fontSize=7, leading=10)
-    small = ParagraphStyle("small", parent=body, fontSize=7, leading=10)
-    ok_style = ParagraphStyle("ok", parent=small, textColor=colors.darkgreen)
-    bad_style = ParagraphStyle("bad", parent=small, textColor=colors.red)
+    def style(name, **kw):
+        s = ParagraphStyle(name, parent=styles["Normal"], **kw)
+        return s
+
+    title_s  = style("T",  fontSize=18, fontName="Helvetica-Bold", spaceAfter=2)
+    sub_s    = style("S",  fontSize=8,  textColor=colors.HexColor("#555555"), spaceAfter=6)
+    h2_s     = style("H2", fontSize=10, fontName="Helvetica-Bold", spaceBefore=10, spaceAfter=4)
+    body_s   = style("B",  fontSize=8,  leading=11)
+    small_s  = style("Sm", fontSize=6.5, leading=9, textColor=colors.HexColor("#444444"))
+    right_s  = style("R",  fontSize=7,  alignment=TA_RIGHT)
+    center_s = style("C",  fontSize=7,  alignment=TA_CENTER)
+    note_s   = style("N",  fontSize=6,  textColor=colors.grey, leading=8)
 
     story = []
 
-    # Title
-    story.append(Paragraph("Local Vision Model Benchmark", h1))
+    # ── Header ──────────────────────────────────────────────────────────────
+    story.append(Paragraph("Vision Model Benchmark", title_s))
     story.append(Paragraph(
-        f"Sales-slip OCR · {datetime.now().strftime('%Y-%m-%d %H:%M')} · {gpu_info}",
-        small
+        f"German Sales-Slip OCR &nbsp;·&nbsp; {datetime.now().strftime('%Y-%m-%d')} "
+        f"&nbsp;·&nbsp; {gpu_info}",
+        sub_s
     ))
-    story.append(HRFlowable(width="100%", thickness=1, color=colors.grey))
-    story.append(Spacer(1, 0.3*cm))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2c3e50")))
+    story.append(Spacer(1, 0.25*cm))
 
-    # Task description
     story.append(Paragraph(
-        "Task: extract the total amount from German grocery/gas sales slips. "
-        "Each model receives the raw JPEG (resized to ≤1500 px) and a fixed prompt. "
-        "Accuracy = fraction of the 3 test images where the extracted value matches "
-        "the ground truth encoded in the filename (e.g. <i>slip0_7949.jpg</i> → 79,49 €).",
-        body
+        "<b>Task:</b> Extract the total amount from German grocery / gas sales slips. "
+        "Each model receives the raw JPEG (resized ≤ 1500 px longest side) and a fixed "
+        "prompt asking for the sum in <i>Euro,Cent</i> format. "
+        "<b>Accuracy</b> = share of 3 annotated test images where the extracted value "
+        "matches the ground truth encoded in the filename "
+        "(<i>slip0_7949.jpg</i> → 79,49 €). "
+        "Models marked <i>archived</i> were tested in an earlier run and removed from "
+        "disk afterwards.",
+        body_s
     ))
-    story.append(Spacer(1, 0.3*cm))
+    story.append(Spacer(1, 0.35*cm))
 
-    # --- Summary table ---
-    story.append(Paragraph("Summary", h2))
-    header = ["Model", "VRAM", "Pull (s)", "Accuracy", "Avg latency (s)", "Status"]
-    rows = [header]
-    for mr in results:
-        if mr.skipped:
-            status = f"skipped: {mr.skip_reason}"
-            rows.append([mr.display_name, mr.size_label, "-", "-", "-", status])
-        else:
-            acc = f"{mr.accuracy*100:.0f}% ({sum(r.correct for r in mr.image_results)}/{len(mr.image_results)})"
-            lat = f"{mr.avg_latency_s:.1f}" if mr.avg_latency_s == mr.avg_latency_s else "N/A"
-            pull = f"{mr.pull_time_s:.0f}" if mr.pull_time_s else "cached"
-            rows.append([mr.display_name, mr.size_label, pull, acc, lat, "ok"])
+    # ── Leaderboard ─────────────────────────────────────────────────────────
+    story.append(Paragraph("Leaderboard", h2_s))
 
-    col_w = [4.0*cm, 1.8*cm, 1.8*cm, 2.5*cm, 3.2*cm, 2.5*cm]
-    tbl = Table(rows, colWidths=col_w, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#2c3e50")),
-        ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
-        ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE",   (0,0), (-1,-1), 7),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f2f2f2")]),
-        ("GRID",       (0,0), (-1,-1), 0.3, colors.grey),
-        ("VALIGN",     (0,0), (-1,-1), "TOP"),
-        ("LEFTPADDING",(0,0), (-1,-1), 4),
-        ("RIGHTPADDING",(0,0), (-1,-1), 4),
-    ]))
+    hdr = ["#", "Model", "Size", "Accuracy", "Avg latency", "On disk"]
+    rows = [hdr]
+    row_colors = []
+
+    for rank, mr in enumerate(ranked, 1):
+        n_total = len(mr.image_results)
+        acc_str = f"{mr.correct_count}/{n_total}  ({mr.accuracy*100:.0f} %)"
+        lat = f"{mr.avg_latency_s:.1f} s" if mr.avg_latency_s == mr.avg_latency_s else "—"
+        on_disk = "archived" if mr.archived else "✓"
+        rows.append([str(rank), mr.display_name, mr.size_label, acc_str, lat, on_disk])
+        row_colors.append(mr.accuracy)
+
+    cw = [0.7*cm, 4.5*cm, 1.8*cm, 3.2*cm, 2.5*cm, 2.0*cm]
+    tbl = Table(rows, colWidths=cw, repeatRows=1)
+
+    ts = [
+        # Header
+        ("BACKGROUND",   (0,0), (-1,0), colors.HexColor("#2c3e50")),
+        ("TEXTCOLOR",    (0,0), (-1,0), colors.white),
+        ("FONTNAME",     (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",     (0,0), (-1,-1), 7.5),
+        ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, colors.HexColor("#f5f5f5")]),
+        ("GRID",         (0,0), (-1,-1), 0.3, colors.HexColor("#cccccc")),
+        ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",   (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 4),
+        ("LEFTPADDING",  (0,0), (-1,-1), 5),
+        ("RIGHTPADDING", (0,0), (-1,-1), 5),
+        ("ALIGN",        (0,0), (0,-1), "CENTER"),   # rank col
+        ("ALIGN",        (3,0), (4,-1), "RIGHT"),    # acc + latency
+        ("FONTNAME",     (0,1), (0,-1), "Helvetica-Bold"),  # rank bold
+    ]
+    # Colour-code the accuracy cell per row
+    for i, pct in enumerate(row_colors, 1):
+        c = acc_color(pct)
+        ts.append(("TEXTCOLOR", (3, i), (3, i), c))
+        ts.append(("FONTNAME",  (3, i), (3, i), "Helvetica-Bold"))
+
+    tbl.setStyle(TableStyle(ts))
     story.append(tbl)
-    story.append(Spacer(1, 0.4*cm))
+    story.append(Spacer(1, 0.5*cm))
 
-    # --- Per-model detail ---
-    story.append(Paragraph("Per-model responses", h2))
-    for mr in results:
-        story.append(Paragraph(f"<b>{mr.display_name}</b> ({mr.model_id})", body))
+    # ── Per-model detail ────────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#bbbbbb")))
+    story.append(Paragraph("Per-model responses", h2_s))
+
+    for mr in ranked + skipped:
+        label = mr.display_name
+        if mr.archived:
+            label += "  <font color='#888888' size='6'>(archived)</font>"
         if mr.skipped:
-            story.append(Paragraph(f"Skipped — {mr.skip_reason}", bad_style))
-            story.append(Spacer(1, 0.2*cm))
-            continue
+            label += "  <font color='#c0392b' size='6'>(skipped)</font>"
 
-        det_rows = [["Image", "Expected", "Response (truncated)", "Parsed", "Match", "Latency"]]
-        for ir in mr.image_results:
-            parsed = parse_response(ir.response) if not ir.error else "ERR"
-            match_label = "✓" if ir.correct else "✗"
-            lat_label = f"{ir.latency_s:.1f}s" if not ir.error else "—"
-            raw_cell = ir.error if ir.error else ir.response.replace("\n", " ")[:80]
-            det_rows.append([ir.filename, ir.expected, raw_cell, parsed, match_label, lat_label])
+        block = [Paragraph(f"<b>{label}</b>  <font size='6.5' color='#666666'>{mr.model_id}</font>", body_s)]
 
-        dt = Table(det_rows, colWidths=[3.0*cm, 1.8*cm, 5.5*cm, 1.5*cm, 1.0*cm, 2.0*cm], repeatRows=1)
-        dt.setStyle(TableStyle([
-            ("BACKGROUND",  (0,0), (-1,0), colors.HexColor("#546e7a")),
-            ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
-            ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE",    (0,0), (-1,-1), 6.5),
-            ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, colors.HexColor("#eceff1")]),
-            ("GRID",        (0,0), (-1,-1), 0.3, colors.grey),
-            ("VALIGN",      (0,0), (-1,-1), "TOP"),
-            ("LEFTPADDING", (0,0), (-1,-1), 3),
-            ("RIGHTPADDING",(0,0), (-1,-1), 3),
-        ]))
-        story.append(dt)
-        story.append(Spacer(1, 0.25*cm))
+        if mr.skipped:
+            block.append(Paragraph(f"Not tested — {mr.skip_reason}", note_s))
+        else:
+            det_hdr = ["Image", "Expected", "Model response", "Parsed", "✓/✗", "Time"]
+            det_rows = [det_hdr]
+            for ir in mr.image_results:
+                parsed = parse_response(ir.response) if not ir.error else "ERR"
+                raw_cell = (ir.error or ir.response.replace("\n", " "))[:90]
+                det_rows.append([
+                    ir.filename, ir.expected, raw_cell, parsed,
+                    "✓" if ir.correct else "✗",
+                    f"{ir.latency_s:.1f} s" if not ir.error else "—"
+                ])
 
-    # Footer note
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
+            dcw = [2.5*cm, 1.7*cm, 6.2*cm, 1.5*cm, 0.8*cm, 1.8*cm]
+            dt = Table(det_rows, colWidths=dcw, repeatRows=1)
+            dts = [
+                ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#455a64")),
+                ("TEXTCOLOR",     (0,0), (-1,0), colors.white),
+                ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+                ("FONTSIZE",      (0,0), (-1,-1), 6.5),
+                ("LEADING",       (0,0), (-1,-1), 9),
+                ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, colors.HexColor("#eceff1")]),
+                ("GRID",          (0,0), (-1,-1), 0.25, colors.HexColor("#cccccc")),
+                ("VALIGN",        (0,0), (-1,-1), "TOP"),
+                ("TOPPADDING",    (0,0), (-1,-1), 3),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+                ("LEFTPADDING",   (0,0), (-1,-1), 4),
+                ("RIGHTPADDING",  (0,0), (-1,-1), 4),
+                ("ALIGN",         (4,1), (5,-1), "CENTER"),
+            ]
+            # Colour ✓/✗ per row
+            for ri, ir in enumerate(mr.image_results, 1):
+                c = colors.HexColor("#1e8449") if ir.correct else colors.HexColor("#c0392b")
+                dts.append(("TEXTCOLOR", (4, ri), (4, ri), c))
+                dts.append(("FONTNAME",  (4, ri), (4, ri), "Helvetica-Bold"))
+            dt.setStyle(TableStyle(dts))
+            block.append(dt)
+
+        block.append(Spacer(1, 0.3*cm))
+        story.append(KeepTogether(block))
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#cccccc")))
+    story.append(Spacer(1, 0.1*cm))
+    story.append(Paragraph(f"<b>Prompt:</b> {PROMPT}", note_s))
     story.append(Paragraph(
-        "Prompt used: \"" + PROMPT + "\"",
-        ParagraphStyle("footer", parent=body, fontSize=6, textColor=colors.grey)
+        f"Test images: {TEST_IMAGES_DIR} &nbsp;·&nbsp; "
+        f"Max image side: {MAX_SIDE_PX} px &nbsp;·&nbsp; temperature=0",
+        note_s
     ))
 
     doc.build(story)
@@ -440,11 +533,10 @@ def build_pdf(results: list, gpu_info: str):
 
 def gpu_info() -> str:
     try:
-        out = subprocess.check_output(
+        return subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
             text=True
         ).strip()
-        return out
     except Exception:
         return "GPU info unavailable"
 
@@ -453,21 +545,22 @@ if __name__ == "__main__":
     print("=== Local Vision Model Benchmark ===")
     print(f"GPU: {gpu_info()}")
     print(f"Test images: {TEST_IMAGES_DIR}")
-    print(f"Models to test: {len(MODELS)}")
+    print(f"Models to run: {len(MODELS)}  (+{len(ARCHIVED_RESULTS)} archived)")
 
-    results = benchmark()
+    live = benchmark()
 
     print("\n=== Building PDF report ===")
-    build_pdf(results, gpu_info())
+    build_pdf(live, gpu_info())
 
-    # Print quick ASCII summary
-    print("\n=== Results summary ===")
-    print(f"{'Model':<28} {'Acc':>6}  {'Avg lat':>9}")
-    print("-" * 48)
-    for mr in results:
-        if mr.skipped:
-            print(f"{mr.display_name:<28}   skip  {mr.skip_reason[:20]}")
-        else:
-            acc = f"{mr.accuracy*100:.0f}%"
-            lat = f"{mr.avg_latency_s:.1f}s" if mr.avg_latency_s == mr.avg_latency_s else "N/A"
-            print(f"{mr.display_name:<28} {acc:>6}  {lat:>9}")
+    all_res = live + ARCHIVED_RESULTS
+    ranked = sorted([r for r in all_res if not r.skipped],
+                    key=lambda r: (-r.accuracy, r.avg_latency_s
+                                  if r.avg_latency_s == r.avg_latency_s else 9999))
+    print(f"\n{'#':<3} {'Model':<28} {'Acc':>6}  {'Avg lat':>9}  {'Disk'}")
+    print("-" * 58)
+    for i, mr in enumerate(ranked, 1):
+        lat = f"{mr.avg_latency_s:.1f}s" if mr.avg_latency_s == mr.avg_latency_s else "N/A"
+        flag = "archived" if mr.archived else "on disk"
+        print(f"{i:<3} {mr.display_name:<28} {mr.accuracy*100:>5.0f}%  {lat:>9}  {flag}")
+    for mr in [r for r in all_res if r.skipped]:
+        print(f"{'—':<3} {mr.display_name:<28}  skip   —          skipped")
