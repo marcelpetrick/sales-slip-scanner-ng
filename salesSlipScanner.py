@@ -1,148 +1,398 @@
-import requests
-import os
+#!/usr/bin/env python3
+"""
+Sales Slip Scanner
+==================
+OCR German grocery / gas receipts using a local ollama vision model.
+
+Usage
+-----
+    python salesSlipScanner.py [--model MODEL_NAME]
+
+Drop image files (JPEG, PNG, GIF) into the ``input/`` directory next to this
+script, then run it.  Each file whose total is successfully extracted gets
+renamed to include the detected price before its extension::
+
+    receipt.jpg  →  receipt_7949.jpg   (79,49 €)
+
+A human-readable summary is printed at the end showing every file and the
+grand total of all detected expenses.
+
+Model selection
+---------------
+The default model is the best-performing compact model from the local
+benchmark (see localVisionModelTest/results.pdf).  Pass ``--model`` to
+override:
+
+    python salesSlipScanner.py --model llama3.2-vision:11b
+
+If the chosen model is not installed in the local ollama instance the script
+exits immediately with an instructive error message including the install
+command.
+"""
+
+from __future__ import annotations
+
+import argparse
 import base64
+import io
+import re
+import sys
+from pathlib import Path
+from typing import Optional
+
+import ollama
 from PIL import Image
 
-def send_base64_image_to_openai(base64_image: str, api_key: str) -> None:
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+#: Best accuracy/size balance from the local benchmark (100 %, 3.3 GB).
+DEFAULT_MODEL: str = "qwen3-vl:4b"
+
+#: Directory where users drop files to be processed.
+INPUT_DIR: Path = Path(__file__).parent / "input"
+
+#: Image file extensions that will be picked up.
+SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".gif"})
+
+#: Images are downscaled so the longest side does not exceed this value.
+MAX_SIDE_PX: int = 1500
+
+#: Prompt sent to the vision model for every slip image.
+PROMPT: str = (
+    "What is the sum to pay in the given sales slip? "
+    "It is a German sales slip for groceries or gas. "
+    "Look for 'Summe', 'Gesamt' or 'zu zahlen'. "
+    "Reply with ONLY the amount in the format 'Euro,Cent' (e.g. '79,49'). "
+    "No currency symbol, no extra text. If not found, reply 'NaN'."
+)
+
+# ---------------------------------------------------------------------------
+# Ollama helpers
+# ---------------------------------------------------------------------------
+
+
+def list_local_models() -> list[str]:
+    """Return all model IDs currently installed in the local ollama instance.
+
+    Raises:
+        RuntimeError: If the ollama server cannot be reached.
     """
-    Sends a base64-encoded image to OpenAI and prints the result.
+    try:
+        return [m.model for m in ollama.list().models]
+    except Exception as exc:
+        raise RuntimeError(f"Cannot reach ollama server: {exc}") from exc
+
+
+def ensure_model_available(model_id: str) -> None:
+    """Assert that *model_id* is installed locally; exit with an error if not.
+
+    Performs a prefix match so ``"qwen3-vl:4b"`` matches entries like
+    ``"qwen3-vl:4b-fp16"``.
 
     Args:
-    - base64_image (str): The base64-encoded image string.
-    - api_key (str): Your OpenAI API key.
+        model_id: The ollama model identifier to verify.
+
+    Raises:
+        SystemExit: With exit code 1 when the model is absent.
+        RuntimeError: When the ollama server is unreachable.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
+    available = list_local_models()
+    base = model_id.split(":")[0]
+    tag  = model_id.split(":")[1] if ":" in model_id else ""
+    found = any(
+        m == model_id or (tag and m.startswith(f"{base}:{tag}"))
+        for m in available
+    )
+    if not found:
+        print(f"Error: model '{model_id}' is not installed in ollama.", file=sys.stderr)
+        print(
+            f"  Available: {', '.join(available) if available else '(none)'}",
+            file=sys.stderr,
+        )
+        print(f"  Install:   ollama pull {model_id}", file=sys.stderr)
+        sys.exit(1)
 
-    payload = {
-        "model": "gpt-4-vision-preview",
-        "messages": [
+
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
+
+
+def load_and_encode_image(path: Path) -> str:
+    """Open an image, resize it, and return a base64-encoded JPEG string.
+
+    The image is resized so its longest side is at most *MAX_SIDE_PX* pixels
+    (aspect ratio preserved).  Smaller images pass through unchanged.
+
+    Args:
+        path: Path to the source image file.
+
+    Returns:
+        Base64-encoded JPEG data (no ``data:`` URI prefix).
+    """
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        w, h = img.size
+        scale = min(1.0, MAX_SIDE_PX / max(w, h))
+        if scale < 1.0:
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+def is_already_processed(path: Path) -> bool:
+    """Return ``True`` when the filename already carries a price suffix.
+
+    A price suffix is ``_NNN…`` (3–6 decimal digits) immediately before the
+    file extension, e.g. ``receipt_7949.jpg``.  Files matching this pattern
+    are skipped so re-runs are idempotent.
+
+    Args:
+        path: File path to inspect (only the name is examined).
+    """
+    return bool(re.search(r"_\d{3,6}\.", path.name))
+
+
+def collect_input_files(directory: Path) -> list[Path]:
+    """Collect all unprocessed, supported image files in *directory*.
+
+    Subdirectories are not traversed.  Files whose names already contain a
+    price suffix (see :func:`is_already_processed`) are silently skipped.
+
+    Args:
+        directory: The directory to scan (must exist).
+
+    Returns:
+        Sorted list of ``Path`` objects ready for processing.
+
+    Raises:
+        FileNotFoundError: If *directory* does not exist.
+    """
+    if not directory.exists():
+        raise FileNotFoundError(f"Input directory not found: {directory}")
+    return sorted(
+        p
+        for p in directory.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        and not is_already_processed(p)
+    )
+
+
+# ---------------------------------------------------------------------------
+# OCR
+# ---------------------------------------------------------------------------
+
+
+def query_ollama(model_id: str, image_b64: str) -> str:
+    """Submit the base64 image to the vision model and return the raw response.
+
+    Args:
+        model_id: Local ollama model to use.
+        image_b64: Base64-encoded JPEG image data.
+
+    Returns:
+        Stripped text response from the model.
+    """
+    response = ollama.chat(
+        model=model_id,
+        messages=[{
+            "role": "user",
+            "content": PROMPT,
+            "images": [image_b64],
+        }],
+        options={"temperature": 0},
+    )
+    return response.message.content.strip()
+
+
+def parse_price(raw_text: str) -> Optional[int]:
+    """Parse a model response into a price expressed in euro-cents.
+
+    Accepts a wide variety of formats that vision models may produce::
+
+        "79,49"           →  7949
+        "79.49"           →  7949
+        "€ 79,49"         →  7949
+        "Summe: 28,41 €"  →  2841
+
+    The first ``<digits><separator><2 digits>`` pattern in the string wins,
+    so extra verbiage around the number is harmless.
+
+    Args:
+        raw_text: Raw string returned by the vision model.
+
+    Returns:
+        Total price in euro-cents (e.g. ``7949`` for 79,49 €),
+        or ``None`` when no valid amount is found.
+    """
+    match = re.search(r"(\d+)[,.](\d{2})\b", raw_text.strip())
+    if not match:
+        return None
+    return int(match.group(1)) * 100 + int(match.group(2))
+
+
+# ---------------------------------------------------------------------------
+# File renaming
+# ---------------------------------------------------------------------------
+
+
+def build_renamed_path(original: Path, price_cents: int) -> Path:
+    """Return the target path with the price suffix inserted before the extension.
+
+    Example::
+
+        Path("input/receipt.jpg"), 7949  →  Path("input/receipt_7949.jpg")
+
+    Args:
+        original: Original file path.
+        price_cents: Detected price in integer euro-cents.
+
+    Returns:
+        New ``Path`` in the same parent directory as *original*.
+    """
+    return original.parent / f"{original.stem}_{price_cents}{original.suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Per-file processing
+# ---------------------------------------------------------------------------
+
+
+def process_file(path: Path, model_id: str) -> Optional[int]:
+    """OCR a single sales slip and rename it with its detected price.
+
+    On success the original file is renamed in-place and the price in
+    euro-cents is returned.  If no price is detected, or any error occurs,
+    the file is left untouched and ``None`` is returned.
+
+    Args:
+        path: Path to the image file.
+        model_id: Local ollama model to use for OCR.
+
+    Returns:
+        Detected price in euro-cents, or ``None``.
+    """
+    print(f"  {path.name}", end=" … ", flush=True)
+    try:
+        b64         = load_and_encode_image(path)
+        raw         = query_ollama(model_id, b64)
+        price_cents = parse_price(raw)
+
+        if price_cents is None:
+            print(f"SKIP  (response: {raw!r})")
+            return None
+
+        target = build_renamed_path(path, price_cents)
+        path.rename(target)
+        euro = price_cents // 100
+        cent = price_cents % 100
+        print(f"OK  →  {target.name}  ({euro},{cent:02d} €)")
+        return price_cents
+
+    except Exception as exc:
+        print(f"ERROR  ({exc})")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
+def run(
+    model_id: str = DEFAULT_MODEL,
+    input_dir: Path = INPUT_DIR,
+) -> dict:
+    """Scan *input_dir*, OCR each slip, rename files, and print a summary.
+
+    Args:
+        model_id: Local ollama model to use.  Must be installed.
+        input_dir: Directory containing the slip images to process.
+
+    Returns:
+        Summary dictionary::
+
             {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "What is the sum to pay in the given sales slip? It is a german sales slip for groceries or gas. Search for someethhing like `Summe` or `zu zahlen`. Just return the sum in format `Euro Comma Cent`. No currency character. No other return text in the response. If no number was found, return NaN."
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        }
-                    }
-                ]
+                "processed":   int,   # files successfully OCR-ed and renamed
+                "skipped":     int,   # files where no price was found
+                "total_cents": int,   # sum of all detected prices in cents
+                "results":     list,  # per-file dicts with "file" and "price_cents"
             }
-        ],
-        "max_tokens": 300
+
+    Raises:
+        SystemExit(1): If *model_id* is not installed in ollama.
+        FileNotFoundError: If *input_dir* does not exist.
+    """
+    ensure_model_available(model_id)
+
+    files = collect_input_files(input_dir)
+    if not files:
+        print(f"No unprocessed image files found in: {input_dir}/")
+        return {"processed": 0, "skipped": 0, "total_cents": 0, "results": []}
+
+    print(f"Found {len(files)} file(s)  [model: {model_id}]\n")
+
+    results: list[dict] = []
+    for f in files:
+        price = process_file(f, model_id)
+        results.append({"file": f.name, "price_cents": price})
+
+    ok     = [r for r in results if r["price_cents"] is not None]
+    failed = [r for r in results if r["price_cents"] is None]
+    total  = sum(r["price_cents"] for r in ok)
+
+    print(f"\n{'─' * 50}")
+    print(f"  Processed : {len(ok)}")
+    print(f"  Skipped   : {len(failed)}")
+    print(f"  Total     : {total // 100},{total % 100:02d} €")
+    print(f"{'─' * 50}")
+
+    return {
+        "processed":   len(ok),
+        "skipped":     len(failed),
+        "total_cents": total,
+        "results":     results,
     }
 
-    response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-    #print(f"Response: {response.json()}")
-    return response.json()
 
-# ----------------------------
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
-class ImageScanner:
-    def __init__(self, directory_path: str):
-        self.directory_path = directory_path
-        self.supported_extensions = ['.gif', '.jpg', '.png']
-        self.image_paths = []
 
-    def scan_for_images(self) -> None:
-        """
-        Scans the directory for image files and updates the image_paths member with the paths.
-        """
-        try:
-            for root, dirs, files in os.walk(self.directory_path):
-                for file in files:
-                    if any(file.lower().endswith(ext) for ext in self.supported_extensions):
-                        self.image_paths.append(os.path.join(root, file))
-        except Exception as e:
-            print(f"Error scanning directory {self.directory_path}: {e}")
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Build and return parsed CLI arguments.
 
-    def resize_and_convert_images_and_process(self) -> None:
-        """
-        Resizes each image where the longest side is at most 1500px, converts to base64, and prints it.
-        """
-        for image_path in self.image_paths:
-            try:
-                with Image.open(image_path) as img:
-                    original_width, original_height = img.size
-                    scaling_factor = min(1, 1500 / max(original_width, original_height))
-                    new_size = (int(original_width * scaling_factor), int(original_height * scaling_factor))
-                    resized_img = img.resize(new_size, Image.Resampling.LANCZOS)
+    Args:
+        argv: Explicit argument list; defaults to ``sys.argv[1:]``.
+    """
+    parser = argparse.ArgumentParser(
+        description="OCR German grocery/gas sales slips with a local ollama vision model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            f"Default model : {DEFAULT_MODEL}\n"
+            "Workflow      : drop images into input/ → run this script\n"
+            "Rename format : receipt.jpg → receipt_7949.jpg  (79,49 €)"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        metavar="MODEL_NAME",
+        help=(
+            "ollama model to use for OCR (default: %(default)s). "
+            "Must be installed locally; see 'ollama list'."
+        ),
+    )
+    return parser.parse_args(argv)
 
-                    # Convert image to base64
-                    with open("temp_resized_image.jpg", "wb") as temp_file:
-                        resized_img.save(temp_file, format="JPEG")
-                    with open("temp_resized_image.jpg", "rb") as temp_file:
-                        base64_encoded_img = base64.b64encode(temp_file.read())
-                        #print(base64_encoded_img.decode('utf-8'))
-                        api_key = os.getenv("OPENAI_API_KEY")
-                        resonse_json = send_base64_image_to_openai(base64_encoded_img.decode('utf-8'), api_key)
-                        # Accessing and printing the "content"
-                        content = resonse_json['choices'][0]['message']['content']
-                        print(f"File: {image_path}, Content: {content}")
-                        # Convert the euro value to cents
-                        value_in_cents = self.convert_to_cents(content)
 
-                        # Rename the file
-                        self.rename_image_file(image_path, value_in_cents)
-
-            except Exception as e:
-                print(f"Error processing image {image_path}: {e}")
-
-    def convert_to_cents(self, euro_value: str) -> int:
-        """
-        Converts a euro value string to cents.
-
-        Args:
-        - euro_value (str): The euro value string in format "Euro, Cent".
-
-        Returns:
-        - int: The value in cents.
-        """
-        try:
-            euros, cents = euro_value.split(',')
-            total_cents = int(euros) * 100 + int(cents)
-            return total_cents
-        except ValueError:
-            print(f"Invalid euro value format: {euro_value}")
-            return 0
-
-    def rename_image_file(self, image_path: str, value_in_cents: int) -> None:
-        """
-        Renames the image file to include the value in cents before the file extension.
-
-        Args:
-        - image_path (str): The current path of the image file.
-        - value_in_cents (int): The value in cents to include in the file name.
-        """
-        file_directory, file_name = os.path.split(image_path)
-        file_name_without_ext, file_ext = os.path.splitext(file_name)
-        new_file_name = f"{file_name_without_ext}_{value_in_cents}{file_ext}"
-        new_file_path = os.path.join(file_directory, new_file_name)
-
-        os.rename(image_path, new_file_path)
-        print(f"Renamed file {image_path} to {new_file_path}")
-
-# Example usage
 if __name__ == "__main__":
-    directory_path = "test_images"  # Update this to the directory you want to scan
-    scanner = ImageScanner(directory_path)
-    scanner.scan_for_images()
-    # check result with: https://base64.guru/converter/decode/image
-    scanner.resize_and_convert_images_and_process()
-
-# ----------------------------
-
-# result:
-# (venv) [mpetrick@marcel-precision3551 SalesSlipScanner]$ python3 salesSlipScanner.py
-# File: test_images/slip2_1093.jpg, Content: 10,93
-# File: test_images/slip0_7949.jpg, Content: 79,49
-# File: test_images/slip1_2841.jpg, Content: 28,41
-# (venv) [mpetrick@marcel-precision3551 SalesSlipScanner]$
-#
-# So it works :)
+    _args = parse_args()
+    run(model_id=_args.model)

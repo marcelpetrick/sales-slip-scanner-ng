@@ -15,7 +15,7 @@ A local pipeline script exists in the repository root and **must pass successful
 
 Run it with:
 ```
-./pipeline.sh
+./localPipeline.sh
 ```
 
 Do not commit if the pipeline exits with a non-zero status. Fix all failures first, then re-run to confirm green before committing.
