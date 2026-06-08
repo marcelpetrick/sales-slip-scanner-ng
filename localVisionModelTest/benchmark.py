@@ -11,6 +11,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -107,23 +108,43 @@ def installed_model_ids() -> set:
         return set()
 
 
-def pull_model(model_id: str) -> float:
-    """Pull model if absent; return elapsed seconds."""
+def _is_installed(model_id: str) -> bool:
     present = installed_model_ids()
-    # match both "llava:7b" and "llava:7b-..." variants
-    already = any(mid == model_id or mid.startswith(model_id.split(":")[0] + ":" + (model_id.split(":")[1] if ":" in model_id else "")) for mid in present)
-    if already:
-        print(f"  [cache] {model_id} already installed")
+    tag = model_id.split(":")[1] if ":" in model_id else ""
+    base = model_id.split(":")[0]
+    return any(
+        mid == model_id or (tag and mid.startswith(base + ":" + tag))
+        for mid in present
+    )
+
+
+def pull_model(model_id: str, silent: bool = False) -> float:
+    """Pull model if absent; return elapsed seconds (0 if cached)."""
+    if _is_installed(model_id):
+        if not silent:
+            print(f"  [cache] {model_id} already installed")
         return 0.0
-    print(f"  [pull]  downloading {model_id} …", flush=True)
+    if not silent:
+        print(f"  [pull]  downloading {model_id} …", flush=True)
     t0 = time.monotonic()
-    # Stream pull progress to stdout so the user sees progress
     for chunk in ollama.pull(model_id, stream=True):
-        status = getattr(chunk, "status", "") or ""
-        if "pulling" in status or "success" in status:
-            print(f"\r         {status[:80]}    ", end="", flush=True)
-    print()
+        if not silent:
+            status = getattr(chunk, "status", "") or ""
+            if "pulling" in status or "success" in status:
+                print(f"\r         {status[:80]}    ", end="", flush=True)
+    if not silent:
+        print()
     return time.monotonic() - t0
+
+
+def prefetch_model(model_id: str) -> threading.Thread:
+    """Start pulling model_id in a background thread (pipeline prefetch)."""
+    if _is_installed(model_id):
+        return None
+    print(f"  [prefetch] starting background download of {model_id} …", flush=True)
+    t = threading.Thread(target=pull_model, args=(model_id, True), daemon=True)
+    t.start()
+    return t
 
 
 def encode_image(path: Path) -> str:
@@ -185,14 +206,22 @@ def benchmark() -> list:
         sys.exit(f"No JPEG images found in {TEST_IMAGES_DIR}")
 
     results: list[ModelResult] = []
+    prefetch_thread: Optional[threading.Thread] = None
 
-    for spec in MODELS:
+    for i, spec in enumerate(MODELS):
         mid = spec["id"]
         print(f"\n{'='*60}")
         print(f"Model: {spec['display']} ({mid})")
         print(f"{'='*60}")
 
-        # --- pull ---
+        # Wait for the prefetch thread for this model to finish (if any)
+        if prefetch_thread is not None:
+            if prefetch_thread.is_alive():
+                print(f"  [prefetch] waiting for download to finish …", flush=True)
+                prefetch_thread.join()
+            prefetch_thread = None
+
+        # --- pull (will be instant if prefetch already completed) ---
         try:
             pull_time = pull_model(mid)
         except Exception as e:
@@ -203,6 +232,10 @@ def benchmark() -> list:
             continue
 
         mr = ModelResult(mid, spec["display"], spec["size"], pull_time)
+
+        # Kick off prefetch of the NEXT model in background while we run inference
+        if i + 1 < len(MODELS):
+            prefetch_thread = prefetch_model(MODELS[i + 1]["id"])
 
         # --- inference ---
         for img_path in test_images:
@@ -216,7 +249,7 @@ def benchmark() -> list:
                 mr.image_results.append(ImageResult(
                     filename=img_path.name,
                     expected=expected,
-                    response=raw[:120],  # truncate for PDF readability
+                    response=raw[:120],
                     correct=correct,
                     latency_s=latency,
                 ))
@@ -232,12 +265,16 @@ def benchmark() -> list:
                 ))
 
         results.append(mr)
-        # unload model from VRAM before loading the next
+        # Unload model from VRAM before loading the next one
         try:
             ollama.chat(model=mid, messages=[{"role": "user", "content": "."}],
                         options={"num_predict": 1, "keep_alive": "0"})
         except Exception:
             pass
+
+    # Drain any remaining prefetch thread
+    if prefetch_thread and prefetch_thread.is_alive():
+        prefetch_thread.join()
 
     return results
 
