@@ -8,6 +8,7 @@ GPU target: NVIDIA RTX A2000 8GB Laptop GPU (~7.8 GB free VRAM).
 import base64
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -37,14 +38,26 @@ TEST_IMAGES_DIR = REPO_ROOT / "test_images"
 OUTPUT_PDF = Path(__file__).resolve().parent / "results.pdf"
 
 # Vision-capable models that fit in 8 GB VRAM.
-# Sizes are approximate on-disk / VRAM footprints at listed quantisation.
-# Current run: limited to models already on disk due to available disk space.
-# See localVisionModelTest/modelsToTest.md for the full candidate list.
+# Sizes are approximate on-disk footprints at default quantisation.
+# keep=True  → always retain on disk (already installed before this benchmark)
+# keep=False → retain unless disk drops below 2 GB (emergency-only eviction)
 MODELS = [
-    {"id": "moondream",  "display": "Moondream 2",   "size": "~1.7 GB"},
-    {"id": "llava-phi3", "display": "LLaVA-Phi3",    "size": "~2.9 GB"},
-    {"id": "gemma3:4b",  "display": "Gemma 3 4B",    "size": "~3.3 GB"},
-    {"id": "llava:7b",   "display": "LLaVA 1.5 7B",  "size": "~4.7 GB"},
+    # Tier 2 — already installed, keep
+    {"id": "moondream",                          "display": "Moondream 2",          "size": "~1.7 GB", "keep": True},
+    {"id": "llava-phi3",                         "display": "LLaVA-Phi3",           "size": "~2.9 GB", "keep": True},
+    {"id": "gemma3:4b",                          "display": "Gemma 3 4B",           "size": "~3.3 GB", "keep": True},
+    {"id": "llava:7b",                           "display": "LLaVA 1.5 7B",         "size": "~4.7 GB", "keep": True},
+    # Tier 3 — tiny German-receipt specialists, download + remove
+    {"id": "Keyvan/german-ocr-3",               "display": "German-OCR-3",          "size": "~2.7 GB", "keep": False},
+    {"id": "richardyoung/smolvlm2-2.2b-instruct","display": "SmolVLM2 2.2B",        "size": "~2.0 GB", "keep": False},
+    {"id": "minicpm-o:4b",                       "display": "MiniCPM-o 4B",         "size": "~5.0 GB", "keep": False},
+    # Tier 1 — highest quality, download + remove (ordered by size asc)
+    {"id": "qwen3-vl:4b",                        "display": "Qwen3-VL 4B",          "size": "~3.4 GB", "keep": False},
+    {"id": "qwen2.5-vl:7b",                      "display": "Qwen2.5-VL 7B",        "size": "~5.5 GB", "keep": False},
+    {"id": "qwen2-vl:7b",                        "display": "Qwen2-VL 7B",          "size": "~5.5 GB", "keep": False},
+    {"id": "minicpm-v",                          "display": "MiniCPM-V 2.6 8B",     "size": "~6.0 GB", "keep": False},
+    {"id": "bakllava",                           "display": "BakLLaVA 7B",          "size": "~7.4 GB", "keep": False},
+    {"id": "llama3.2-vision:11b",               "display": "Llama 3.2-Vision 11B", "size": "~7.9 GB", "keep": False},
 ]
 
 PROMPT = (
@@ -118,14 +131,22 @@ def _is_installed(model_id: str) -> bool:
     )
 
 
+def free_disk_gb() -> float:
+    st = os.statvfs("/")
+    return st.f_bavail * st.f_frsize / 1024 ** 3
+
+
 def pull_model(model_id: str, silent: bool = False) -> float:
     """Pull model if absent; return elapsed seconds (0 if cached)."""
     if _is_installed(model_id):
         if not silent:
             print(f"  [cache] {model_id} already installed")
         return 0.0
+    free = free_disk_gb()
+    if free < 2.0:
+        raise RuntimeError(f"only {free:.1f} GB free — aborting pull to protect disk")
     if not silent:
-        print(f"  [pull]  downloading {model_id} …", flush=True)
+        print(f"  [pull]  downloading {model_id} … ({free:.1f} GB free)", flush=True)
     t0 = time.monotonic()
     for chunk in ollama.pull(model_id, stream=True):
         if not silent:
@@ -135,6 +156,14 @@ def pull_model(model_id: str, silent: bool = False) -> float:
     if not silent:
         print()
     return time.monotonic() - t0
+
+
+def remove_model(model_id: str) -> None:
+    try:
+        ollama.delete(model_id)
+        print(f"  [cleanup] removed {model_id} from disk")
+    except Exception as e:
+        print(f"  [cleanup] could not remove {model_id}: {e}")
 
 
 def prefetch_model(model_id: str) -> threading.Thread:
@@ -233,9 +262,13 @@ def benchmark() -> list:
 
         mr = ModelResult(mid, spec["display"], spec["size"], pull_time)
 
-        # Kick off prefetch of the NEXT model in background while we run inference
-        if i + 1 < len(MODELS):
-            prefetch_thread = prefetch_model(MODELS[i + 1]["id"])
+        # Kick off prefetch of the NEXT model in background while we run inference.
+        # Skip prefetch for keep=False models: we wait until the current model
+        # is removed from disk first (happens after inference), then pull sequentially
+        # to avoid briefly holding two large models simultaneously.
+        next_spec = MODELS[i + 1] if i + 1 < len(MODELS) else None
+        if next_spec and next_spec.get("keep", True):
+            prefetch_thread = prefetch_model(next_spec["id"])
 
         # --- inference ---
         for img_path in test_images:
@@ -271,6 +304,11 @@ def benchmark() -> list:
                         options={"num_predict": 1, "keep_alive": "0"})
         except Exception:
             pass
+        # Keep all models on disk so the best performers are available locally.
+        # Only remove if disk is critically low (< 2 GB) to protect the filesystem.
+        if free_disk_gb() < 2.0 and not spec.get("keep", True):
+            print(f"  [disk] {free_disk_gb():.1f} GB free — removing {mid} to protect disk")
+            remove_model(mid)
 
     # Drain any remaining prefetch thread
     if prefetch_thread and prefetch_thread.is_alive():
