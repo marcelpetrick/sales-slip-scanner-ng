@@ -5,8 +5,6 @@ Tests each model on German grocery sales slip images and measures accuracy + lat
 GPU target: NVIDIA RTX A2000 8 GB Laptop GPU.
 """
 
-import base64
-import io
 import os
 import re
 import subprocess
@@ -19,7 +17,6 @@ from pathlib import Path
 from typing import Optional
 
 import ollama
-from PIL import Image
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -28,6 +25,8 @@ from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable,
     KeepTogether,
 )
+
+from receipt_ocr import MAX_SIDE_PX, PROMPT, encode_image, format_price, parse_price, query_model
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -47,16 +46,6 @@ OUTPUT_PDF = Path(__file__).resolve().parent / "results.pdf"
 # future benchmark runs; they will be downloaded, tested, and kept on disk
 # unless the 2 GB emergency eviction threshold is hit.
 MODELS: list[dict] = []
-
-PROMPT = (
-    "What is the sum to pay in the given sales slip? "
-    "It is a German sales slip for groceries or gas. "
-    "Look for 'Summe', 'Gesamt' or 'zu zahlen'. "
-    "Reply with ONLY the amount in the format 'Euro,Cent' (e.g. '79,49'). "
-    "No currency symbol, no extra text. If not found, reply 'NaN'."
-)
-
-MAX_SIDE_PX = 1500
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -236,18 +225,6 @@ def prefetch_model(model_id: str) -> Optional[threading.Thread]:
     return t
 
 
-def encode_image(path: Path) -> str:
-    with Image.open(path) as img:
-        img = img.convert("RGB")
-        w, h = img.size
-        scale = min(1.0, MAX_SIDE_PX / max(w, h))
-        if scale < 1.0:
-            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode()
-
-
 def extract_expected(filename: str) -> str:
     m = re.search(r"_(\d+)\.", filename)
     if not m:
@@ -257,20 +234,15 @@ def extract_expected(filename: str) -> str:
 
 
 def parse_response(text: str) -> str:
-    text = text.strip()
-    m = re.search(r"(\d+)[,.](\d{2})", text)
-    return f"{m.group(1)},{m.group(2)}" if m else "NaN"
+    price_cents = parse_price(text)
+    return format_price(price_cents) if price_cents is not None else "NaN"
 
 
 def run_model_on_image(model_id: str, image_path: Path) -> tuple[str, float]:
     b64 = encode_image(image_path)
     t0 = time.monotonic()
-    resp = ollama.chat(
-        model=model_id,
-        messages=[{"role": "user", "content": PROMPT, "images": [b64]}],
-        options={"temperature": 0},
-    )
-    return resp.message.content.strip(), time.monotonic() - t0
+    response = query_model(model_id, b64)
+    return response, time.monotonic() - t0
 
 
 # ---------------------------------------------------------------------------

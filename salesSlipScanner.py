@@ -33,15 +33,14 @@ command.
 from __future__ import annotations
 
 import argparse
-import base64
-import io
 import re
 import sys
 from pathlib import Path
 from typing import Optional
 
 import ollama
-from PIL import Image
+
+from receipt_ocr import encode_image, parse_price, query_model
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -55,18 +54,6 @@ INPUT_DIR: Path = Path(__file__).parent / "input"
 
 #: Image file extensions that will be picked up.
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".gif"})
-
-#: Images are downscaled so the longest side does not exceed this value.
-MAX_SIDE_PX: int = 1500
-
-#: Prompt sent to the vision model for every slip image.
-PROMPT: str = (
-    "What is the sum to pay in the given sales slip? "
-    "It is a German sales slip for groceries or gas. "
-    "Look for 'Summe', 'Gesamt' or 'zu zahlen'. "
-    "Reply with ONLY the amount in the format 'Euro,Cent' (e.g. '79,49'). "
-    "No currency symbol, no extra text. If not found, reply 'NaN'."
-)
 
 # ---------------------------------------------------------------------------
 # Ollama helpers
@@ -132,17 +119,7 @@ def load_and_encode_image(path: Path) -> str:
     Returns:
         Base64-encoded JPEG data (no ``data:`` URI prefix).
     """
-    with Image.open(path) as img:
-        img = img.convert("RGB")
-        w, h = img.size
-        scale = min(1.0, MAX_SIDE_PX / max(w, h))
-        if scale < 1.0:
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode()
+    return encode_image(path)
 
 
 def is_already_processed(path: Path) -> bool:
@@ -199,42 +176,7 @@ def query_ollama(model_id: str, image_b64: str) -> str:
     Returns:
         Stripped text response from the model.
     """
-    response = ollama.chat(
-        model=model_id,
-        messages=[{
-            "role": "user",
-            "content": PROMPT,
-            "images": [image_b64],
-        }],
-        options={"temperature": 0},
-    )
-    return response.message.content.strip()
-
-
-def parse_price(raw_text: str) -> Optional[int]:
-    """Parse a model response into a price expressed in euro-cents.
-
-    Accepts a wide variety of formats that vision models may produce::
-
-        "79,49"           →  7949
-        "79.49"           →  7949
-        "€ 79,49"         →  7949
-        "Summe: 28,41 €"  →  2841
-
-    The first ``<digits><separator><2 digits>`` pattern in the string wins,
-    so extra verbiage around the number is harmless.
-
-    Args:
-        raw_text: Raw string returned by the vision model.
-
-    Returns:
-        Total price in euro-cents (e.g. ``7949`` for 79,49 €),
-        or ``None`` when no valid amount is found.
-    """
-    match = re.search(r"(\d+)[,.](\d{2})\b", raw_text.strip())
-    if not match:
-        return None
-    return int(match.group(1)) * 100 + int(match.group(2))
+    return query_model(model_id, image_b64)
 
 
 # ---------------------------------------------------------------------------
