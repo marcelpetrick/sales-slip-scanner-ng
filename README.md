@@ -10,6 +10,8 @@ The application runs entirely against a local Ollama server. It sends no receipt
 
 **License: GPLv3 or later. See `LICENSE`.**
 
+![Hot-folder pipeline schematic](media/project-impression-blueprint-schematic.gif)
+
 ## Project history
 
 - **2024:** the first proof of concept sent receipt images to a remote vision API and renamed files with the detected amount. See [old project](https://github.com/marcelpetrick/codingWithGPT/tree/master/SalesSlipScanner).
