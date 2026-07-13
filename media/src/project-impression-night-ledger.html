@@ -1,0 +1,107 @@
+<title>Impression III — Night Ledger</title>
+<style>
+  :root{
+    --ground:#14100c;
+    --amber-hi:#f0b24c;
+    --amber-lo:#8a4f18;
+    --cream:#f3ead6;
+    --slate:#5b6a67;
+    --slip:#e7dfc9;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;}
+  body{
+    display:flex;align-items:center;justify-content:center;
+    min-height:100%;overflow:auto;background:#000;
+    font-family:ui-monospace,"Cascadia Mono","JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+  }
+  .stage{
+    width:640px;height:480px;flex-shrink:0;position:relative;overflow:hidden;
+    background:
+      radial-gradient(560px 420px at 16% 8%, rgba(240,178,76,.20), transparent 62%),
+      radial-gradient(900px 700px at 50% 100%, rgba(0,0,0,0) 0%, rgba(0,0,0,.55) 100%),
+      var(--ground);
+  }
+
+  .cord{ position:absolute; left:98px; top:0; width:1px; height:64px; background:rgba(240,178,76,.35); }
+  .bulb-halo{
+    position:absolute; left:60px; top:36px; width:80px; height:80px; border-radius:50%;
+    background:radial-gradient(circle, rgba(240,178,76,.55), transparent 70%);
+    filter:blur(6px);
+  }
+  .bulb{
+    position:absolute; left:94px; top:60px; width:10px; height:10px; border-radius:50%;
+    background:var(--amber-hi); box-shadow:0 0 14px 4px rgba(240,178,76,.85);
+  }
+
+  .slips{ position:absolute; left:-40px; bottom:-60px; width:340px; height:280px; }
+  .slip{
+    position:absolute; width:150px; height:230px; background:var(--slip);
+    box-shadow:0 20px 46px -18px rgba(0,0,0,.75);
+    opacity:.14;
+  }
+  .slip.s1{ left:0; bottom:0; transform:rotate(-11deg); opacity:.10; }
+  .slip.s2{ left:60px; bottom:-14px; transform:rotate(-3deg); opacity:.13; }
+  .slip.s3{ left:126px; bottom:6px; transform:rotate(6deg); opacity:.16; }
+
+  .eyebrow{
+    position:absolute; left:40px; top:26px;
+    font-size:10px; letter-spacing:.32em; color:var(--slate);
+    text-transform:uppercase;
+  }
+
+  .hero{
+    position:absolute; left:40px; right:40px; top:168px;
+    font-family:Georgia,"Iowan Old Style","Palatino Linotype","Book Antiqua",serif;
+  }
+  .hero .total{
+    font-size:76px; line-height:1; color:var(--cream); font-weight:400;
+    font-variant-numeric:tabular-nums;
+    text-shadow:0 0 46px rgba(240,178,76,.28);
+    text-wrap:balance;
+  }
+  .hero .tagline{
+    margin-top:16px; font-size:18px; font-style:italic; color:#cbbfa0;
+  }
+
+  .footer{
+    position:absolute; left:40px; right:40px; bottom:28px;
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-size:9.5px; letter-spacing:.1em; color:var(--slate);
+    font-variant-numeric:tabular-nums;
+    border-top:1px solid rgba(91,106,103,.4);
+    padding-top:12px;
+  }
+
+  .caption{
+    position:absolute; right:40px; top:26px; text-align:right;
+    max-width:220px; font-size:10px; line-height:1.6; color:var(--slate);
+  }
+  .caption b{ color:#9c8f70; }
+</style>
+
+<div class="stage">
+  <div class="cord"></div>
+  <div class="bulb-halo"></div>
+  <div class="bulb"></div>
+
+  <div class="slips">
+    <div class="slip s1"></div>
+    <div class="slip s2"></div>
+    <div class="slip s3"></div>
+  </div>
+
+  <div class="eyebrow">Sales Slip Scanner NG</div>
+  <div class="caption"><b>Impression III — Night Ledger.</b><br>One lamp, one machine, no wire out.</div>
+
+  <div class="hero">
+    <div class="total">118,83&nbsp;€</div>
+    <div class="tagline">Every slip stays on this machine.</div>
+  </div>
+
+  <div class="footer">
+    <span>qwen3.5:4b · local vision</span>
+    <span>SHA-256 verified</span>
+    <span>0 bytes left the room</span>
+  </div>
+</div>

@@ -1,0 +1,158 @@
+<title>Impression II — Schematic</title>
+<style>
+  :root{
+    --navy:#0d2847;
+    --navy-deep:#081b30;
+    --line:#7ec8e3;
+    --line-dim:rgba(126,200,227,.32);
+    --paper:#eaf3f8;
+    --amber:#e8a33d;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;}
+  body{
+    display:flex;align-items:center;justify-content:center;
+    min-height:100%;overflow:auto;background:#040a12;
+    font-family:ui-monospace,"Cascadia Mono","JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+  }
+  .stage{
+    width:640px;height:480px;flex-shrink:0;position:relative;overflow:hidden;
+    background:radial-gradient(ellipse at 50% 0%, var(--navy) 0%, var(--navy-deep) 78%);
+    color:var(--paper);
+  }
+  .grid{
+    position:absolute;inset:0;
+    background-image:
+      linear-gradient(var(--line-dim) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line-dim) 1px, transparent 1px);
+    background-size:24px 24px;
+    opacity:.35;
+  }
+
+  .dim-top{ position:absolute; top:18px; left:52px; right:52px; height:1px; background:var(--line-dim); }
+  .dim-top::before,.dim-top::after{ content:""; position:absolute; top:-5px; width:1px; height:11px; background:var(--line-dim); }
+  .dim-top::before{ left:0; } .dim-top::after{ right:0; }
+  .dim-top-label{
+    position:absolute; top:5px; left:0; right:0; text-align:center;
+    font-size:9px; letter-spacing:.25em; color:var(--line-dim);
+  }
+  .dim-left{ position:absolute; left:18px; top:52px; bottom:52px; width:1px; background:var(--line-dim); }
+  .dim-left::before,.dim-left::after{ content:""; position:absolute; left:-5px; width:11px; height:1px; background:var(--line-dim); }
+  .dim-left::before{ top:0; } .dim-left::after{ bottom:0; }
+  .dim-left-label{
+    position:absolute; left:-16px; top:50%; transform:translateY(-50%) rotate(-90deg);
+    font-size:9px; letter-spacing:.25em; color:var(--line-dim); white-space:nowrap;
+  }
+
+  .heading{ position:absolute; top:34px; left:52px; }
+  .heading .h1{ font-weight:700; font-size:13px; letter-spacing:.08em; color:var(--paper); }
+  .heading .h2{ margin-top:3px; font-size:9.5px; letter-spacing:.22em; color:var(--line); text-transform:uppercase; }
+
+  .diagram{ position:absolute; top:150px; left:45px; right:45px; height:190px; }
+  .node{ position:absolute; top:0; width:110px; text-align:center; }
+  .node .label{ margin-top:12px; font-size:9px; letter-spacing:.05em; color:var(--paper); }
+  .node .sub{ margin-top:2px; font-size:7.5px; letter-spacing:.1em; color:var(--line); }
+  .n1{ left:4px; } .n2{ left:148px; } .n3{ left:292px; } .n4{ left:436px; }
+
+  .icon{ height:64px; display:flex; align-items:center; justify-content:center; position:relative; }
+
+  /* folder */
+  .folder-tab{ position:absolute; top:14px; left:24px; width:26px; height:8px; border:1.5px solid var(--line); border-bottom:none; }
+  .folder-body{ position:absolute; top:20px; width:64px; height:38px; border:1.5px solid var(--line); }
+
+  /* eye / lens */
+  .lens-outer{ width:56px; height:56px; border-radius:50%; border:1.5px solid var(--line); display:flex; align-items:center; justify-content:center; position:relative; }
+  .lens-inner{ width:26px; height:26px; border-radius:50%; border:1.5px solid var(--amber); }
+  .lens-pupil{ position:absolute; width:8px; height:8px; border-radius:50%; background:var(--amber); }
+  .sweep{ position:absolute; width:28px; height:1.5px; background:linear-gradient(90deg,var(--amber),transparent); top:50%; left:50%; transform-origin:0 50%; animation:spin 3.4s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce){ .sweep{ animation:none; transform:rotate(35deg); } }
+
+  /* padlock */
+  .lock-shackle{ position:absolute; top:10px; width:26px; height:20px; border:1.5px solid var(--line); border-bottom:none; border-radius:14px 14px 0 0; }
+  .lock-body{ position:absolute; top:26px; width:42px; height:32px; border:1.5px solid var(--line); }
+  .lock-key{ position:absolute; top:38px; width:4px; height:8px; background:var(--line); }
+
+  /* document */
+  .doc-body{ position:absolute; top:8px; width:48px; height:56px; border:1.5px solid var(--line); }
+  .doc-line{ position:absolute; height:1.5px; width:30px; background:var(--line-dim); }
+  .doc-total{ position:absolute; height:1.5px; width:30px; background:var(--amber); }
+
+  .arrow{ position:absolute; top:32px; height:1.5px; background:var(--line); }
+  .arrow::after{
+    content:""; position:absolute; right:-1px; top:-4px;
+    border-style:solid; border-width:5px 0 5px 7px;
+    border-color:transparent transparent transparent var(--line);
+  }
+  .a1{ left:114px; width:34px; } .a2{ left:258px; width:34px; } .a3{ left:402px; width:34px; }
+
+  .titleblock{
+    position:absolute; right:52px; bottom:44px; width:236px;
+    border:1.5px solid var(--line); padding:10px 12px 12px;
+    font-size:9.5px; line-height:1.9; letter-spacing:.02em;
+  }
+  .titleblock .row{ display:flex; justify-content:space-between; gap:10px; }
+  .titleblock .row b{ color:var(--line); font-weight:600; letter-spacing:.08em; }
+  .titleblock hr{ border:none; border-top:1px solid var(--line-dim); margin:5px 0; }
+
+  .caption{ position:absolute; left:52px; bottom:44px; width:220px; font-size:10px; line-height:1.6; color:var(--line); }
+  .caption b{ color:var(--paper); }
+</style>
+
+<div class="stage">
+  <div class="grid"></div>
+
+  <div class="dim-top"><div class="dim-top-label">640</div></div>
+  <div class="dim-left"><div class="dim-left-label">480</div></div>
+
+  <div class="heading">
+    <div class="h1">SALES SLIP SCANNER — NG</div>
+    <div class="h2">Sys. Schematic · Hot-Folder Pipeline</div>
+  </div>
+
+  <div class="diagram">
+    <div class="node n1">
+      <div class="icon"><div class="folder-tab"></div><div class="folder-body"></div></div>
+      <div class="label">HOT_FOLDER/</div>
+      <div class="sub">JPG · PNG · GIF · WEBP</div>
+    </div>
+    <div class="arrow a1"></div>
+
+    <div class="node n2">
+      <div class="icon"><div class="lens-outer"><div class="lens-inner"></div><div class="lens-pupil"></div><div class="sweep"></div></div></div>
+      <div class="label">OLLAMA · qwen3.5:4b</div>
+      <div class="sub">VISION SCAN, LOCAL</div>
+    </div>
+    <div class="arrow a2"></div>
+
+    <div class="node n3">
+      <div class="icon"><div class="lock-shackle"></div><div class="lock-body"></div><div class="lock-key"></div></div>
+      <div class="label">SHA-256 LOCK</div>
+      <div class="sub">DEDUP BY CONTENT</div>
+    </div>
+    <div class="arrow a3"></div>
+
+    <div class="node n4">
+      <div class="icon">
+        <div class="doc-body"></div>
+        <div class="doc-line" style="top:20px;left:calc(50% - 15px);"></div>
+        <div class="doc-line" style="top:30px;left:calc(50% - 15px);"></div>
+        <div class="doc-line" style="top:40px;left:calc(50% - 15px);"></div>
+        <div class="doc-total" style="top:52px;left:calc(50% - 15px);"></div>
+      </div>
+      <div class="label">receipt-report.md</div>
+      <div class="sub">ATOMIC WRITE</div>
+    </div>
+  </div>
+
+  <div class="caption"><b>Impression II — Schematic.</b><br>Four stages, one machine, nothing off-site.</div>
+
+  <div class="titleblock">
+    <div class="row"><b>PROJECT</b><span>sales-slip-scanner-ng</span></div>
+    <div class="row"><b>DRAWN BY</b><span>M. Petrick</span></div>
+    <div class="row"><b>REV</b><span>2026-07, local ed.</span></div>
+    <hr>
+    <div class="row"><b>SCALE</b><span>1&nbsp;:&nbsp;1</span></div>
+    <div class="row"><b>NETWORK</b><span>none</span></div>
+  </div>
+</div>

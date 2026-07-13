@@ -1,0 +1,148 @@
+<title>Impression I — The Slip</title>
+<style>
+  :root{
+    --desk-1:#2b241c;
+    --desk-2:#171310;
+    --paper:#ece5d4;
+    --paper-shadow:#c9bfa4;
+    --ink:#22201b;
+    --ink-soft:#5a5346;
+    --stamp:#a6362a;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;}
+  body{
+    display:flex;align-items:center;justify-content:center;
+    min-height:100%;overflow:auto;
+    background:#0b0906;
+    font-family:ui-monospace,"Cascadia Mono","JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+  }
+  .stage{
+    width:640px;height:480px;flex-shrink:0;position:relative;overflow:hidden;
+    background:
+      radial-gradient(ellipse at 30% 20%, #3a3020 0%, transparent 55%),
+      linear-gradient(155deg,var(--desk-1),var(--desk-2) 70%);
+  }
+  .stage::before{
+    content:"";position:absolute;inset:0;
+    background-image:repeating-linear-gradient(90deg, rgba(255,255,255,.02) 0 1px, transparent 1px 3px);
+    mix-blend-mode:overlay;pointer-events:none;
+  }
+
+  .slip{
+    position:absolute;
+    top:14px;left:170px;
+    width:300px;
+    padding:22px 22px 30px;
+    background:var(--paper);
+    color:var(--ink);
+    transform:rotate(-2.4deg);
+    box-shadow:0 18px 40px -12px rgba(0,0,0,.65), 0 2px 0 rgba(0,0,0,.15);
+  }
+  .slip::before,.slip::after{
+    content:"";position:absolute;left:0;right:0;height:11px;
+    background:
+      linear-gradient(135deg, var(--desk-1) 6px, transparent 0) 0 0/12px 12px repeat-x,
+      linear-gradient(-135deg, var(--desk-1) 6px, transparent 0) 0 0/12px 12px repeat-x;
+  }
+  .slip::before{ top:-1px; }
+  .slip::after{ bottom:-1px; transform:scaleY(-1); }
+
+  .brand{
+    text-align:center;
+    font-family:"Futura","Century Gothic","Avenir Next Condensed","Arial Narrow",sans-serif;
+    font-weight:700;
+    font-size:19px;
+    letter-spacing:.06em;
+    line-height:1.15;
+  }
+  .brand small{
+    display:block;margin-top:5px;
+    font-family:inherit;font-weight:600;
+    font-size:9px;letter-spacing:.22em;color:var(--ink-soft);
+  }
+  .addr{
+    text-align:center;font-size:9.5px;color:var(--ink-soft);
+    margin-top:10px;letter-spacing:.03em;
+  }
+  .rule{
+    border:none;border-top:1.5px dashed rgba(34,32,27,.35);
+    margin:12px 0;
+  }
+  .line{
+    display:flex;justify-content:space-between;gap:8px;
+    font-size:11px;line-height:1.75;
+  }
+  .line .qty{ color:var(--ink-soft); font-variant-numeric:tabular-nums; }
+  .total{
+    display:flex;justify-content:space-between;align-items:baseline;
+    font-size:15px;font-weight:700;margin:6px 0 2px;
+    font-variant-numeric:tabular-nums;
+  }
+  .footnote{
+    font-size:9.5px;color:var(--ink-soft);text-align:center;
+    letter-spacing:.02em;margin-top:4px;
+  }
+  .barcode{
+    height:26px;margin:14px 2px 4px;
+    background:repeating-linear-gradient(90deg,
+      var(--ink) 0 2px, transparent 2px 3px,
+      var(--ink) 3px 6px, transparent 6px 8px,
+      var(--ink) 8px 9px, transparent 9px 12px);
+  }
+  .barcode-id{
+    text-align:center;font-size:8.5px;letter-spacing:.14em;color:var(--ink-soft);
+  }
+  .thanks{
+    text-align:center;font-size:9.5px;margin-top:14px;font-style:italic;color:var(--ink-soft);
+  }
+
+  .stamp{
+    position:absolute;left:34px;bottom:118px;
+    width:230px;text-align:center;
+    font-family:"Futura","Century Gothic","Arial Narrow",sans-serif;
+    font-weight:800;font-size:25px;letter-spacing:.12em;
+    color:var(--stamp);
+    border:3px solid var(--stamp);
+    border-radius:6px;
+    padding:6px 4px;
+    transform:rotate(-9deg);
+    opacity:.82;
+    mix-blend-mode:multiply;
+  }
+  .stamp small{
+    display:block;font-size:9px;letter-spacing:.3em;margin-top:2px;font-weight:700;
+  }
+
+  .caption{
+    position:absolute;left:24px;bottom:20px;color:#8d8371;
+    font-size:10.5px;letter-spacing:.05em;max-width:220px;
+  }
+  .caption b{color:#d8cfb8;font-weight:600;}
+</style>
+
+<div class="stage">
+  <div class="caption"><b>Impression I — The Slip.</b><br>The scanner reads receipts; this is its own.</div>
+
+  <div class="slip">
+    <div class="brand">SALES SLIP SCANNER
+      <small>NG · LOCAL EDITION</small>
+    </div>
+    <div class="addr">/hot_folder/ · qwen3.5:4b · Ollama 0.31.2</div>
+    <hr class="rule">
+    <div class="line"><span>hot_folder scan</span><span class="qty">×3</span></div>
+    <div class="line"><span>qwen3.5:4b vision, 9/9</span><span class="qty">PASS</span></div>
+    <div class="line"><span>SHA-256 dedup</span><span class="qty">auto</span></div>
+    <div class="line"><span>markdown report, atomic</span><span class="qty">×1</span></div>
+    <div class="line"><span>originals modified</span><span class="qty">0</span></div>
+    <div class="line"><span>cloud calls sent</span><span class="qty">0</span></div>
+    <hr class="rule">
+    <div class="total"><span>GRAND TOTAL</span><span>118,83&nbsp;€</span></div>
+    <div class="footnote">fuel 79,49 · groceries 28,41 · groceries 10,93</div>
+    <div class="barcode"></div>
+    <div class="barcode-id">SHA-256  8f2c e91a 4d07 ... b3a9</div>
+    <div class="thanks">thank you for not using the cloud</div>
+  </div>
+
+  <div class="stamp">LOCAL ONLY<small>NO API KEY · NO UPLOAD</small></div>
+</div>
