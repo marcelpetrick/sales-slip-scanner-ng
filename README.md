@@ -1,158 +1,151 @@
 # Sales Slip Scanner NG
 
-> **Scan a receipt. Get the total. Done.**  
-> No cloud. No API key. No fees. Just a local vision model doing the work.
+> Drop receipts into a hot folder and get one cumulative Markdown report.
 
-From the 2024-version - not right anymore - we run a local vision-model!
-![](meme.png)
+The application runs entirely against a local Ollama server. It sends no receipt data to a cloud service, requires no API key, and uses `qwen3.5:4b`, the winner of the repository's Ollama 0.31.2 benchmark.
 
----
+**Author:** Marcel Petrick <mail@marcelpetrick.it><br>
+**License:** GPLv3 or later; see `LICENSE`.
 
-**Author: Marcel Petrick <mail@marcelpetrick.it>**
+## Project history
 
-**Note: project is generated with AI.**
+- **2024:** the first proof of concept sent receipt images to a remote vision API and renamed files with the detected amount.
+- **Early 2026:** the application moved fully to local Ollama vision models, gained strict price parsing, safe state, and an offline quality pipeline.
+- **July 2026:** a fresh Ollama 0.31.2 sweep benchmarked 15 compact models over 135 trials. Qwen 3.5 4B was the only 9/9 model.
+- **Current:** the rename workflow is gone. The application is a non-destructive hot-folder processor that produces a cumulative Markdown expense report.
 
-**License: GPLv3 or later. See `LICENSE`.**
+## Features
 
----
+- Fully local receipt processing through Ollama; no cloud runtime or API key.
+- Qwen 3.5 4B selected from measured Ollama 0.31.2 results.
+- Sequential processing with one model warm-up and configurable keep-alive.
+- Original images are never renamed, moved, modified, or deleted.
+- Content-based SHA-256 deduplication, independent of filenames.
+- Failed receipts remain retryable on the next run.
+- Atomic state and Markdown report updates after each receipt.
+- Per-receipt amounts and a cumulative grand total.
+- Exact dependency pins, offline tests, linting, and coverage enforcement.
 
-## The story
+## Workflow
 
-Two years ago I built [a quick proof-of-concept](https://github.com/marcelpetrick/codingWithGPT/tree/master/SalesSlipScanner) that extracted totals from German grocery receipts by sending them to the OpenAI API. It worked — and cost me exactly **15 cents** in API credits for the test run. I wrote it in about an hour and moved on.
+1. Copy JPEG, PNG, GIF, or WebP receipts into `hot_folder/`.
+2. Run `./scanHotFolder.sh`.
+3. Read `hot_folder/receipt-report.md`.
 
-Fast forward to 2026: local vision models have caught up. In a fresh smoke test of **15 models** and 135 total trials, **Qwen 3.5 4B** (3.4 GB) extracted every receipt total correctly in all three repetitions — completely offline, with no per-inference fee and no receipt sent to a remote service.
+The scanner processes new receipt content sequentially and leaves every source image unchanged. It records successful SHA-256 fingerprints in `hot_folder/.sales-slip-scanner.json`, so unchanged files are never counted twice even when copied under another name.
 
-This repository is the next generation: the same idea, fully local, tested, and backed by a repeatable local quality pipeline.
+Failed images remain eligible for the next run. State and Markdown output are replaced atomically after every attempted receipt, and the Ollama model is warmed once and retained for ten minutes by default.
 
----
+## Build and verify
 
-## What it does
-
-Drop receipt images into `input/`, run the script, and each file is renamed to include its detected total:
-
-```
-receipt.jpg  →  receipt_7949.jpg   (79,49 €)
-```
-
-A summary with the grand total is printed at the end. Successful operations are recorded in `input/.sales-slip-scanner.json`, and an existing destination is never overwritten.
-
----
-
-## Live output
-
-```
-❯ python salesSlipScanner.py
-No unprocessed image files found in: .../input/
-
-❯ cp test_images/slip*.jpg input/
-
-❯ python salesSlipScanner.py
-Found 3 file(s)  [model: qwen3.5:4b]
-
-  slip0.jpg … OK  →  slip0_7949.jpg  (79,49 €)
-  slip1.jpg … OK  →  slip1_2841.jpg  (28,41 €)
-  slip2.jpg … OK  →  slip2_1093.jpg  (10,93 €)
-
-──────────────────────────────────────────────────
-  Processed : 3
-  Skipped   : 0
-  Total     : 118,83 €
-──────────────────────────────────────────────────
-```
-
----
-
-## Benchmark
-
-Fifteen vision models were tested on three annotated German grocery/gas receipts, with three runs per image. Full trial data and compatibility errors are in [`results.md`](localVisionModelTest/results.md), [`results.json`](localVisionModelTest/results.json), and the [one-page PDF](localVisionModelTest/results.pdf).
-
-| # | Model | Exact | Stable receipts | Warm median |
-|---:|---|---:|---:|---:|
-| 1 | **Qwen 3.5 4B** ← default | **9/9** | **3/3** | 0.46 s |
-| 2 | Ministral 3 3B | 6/9 | 2/3 | **0.32 s** |
-| 3 | Qwen 3.5 2B | 6/9 | 2/3 | 0.40 s |
-| 4 | Gemma 3 4B | 6/9 | 2/3 | 0.53 s |
-| 5 | MiniCPM-V 2.6 8B | 6/9 | 2/3 | 0.68 s |
-| 6 | MiniCPM-V 4.5 8B | 6/9 | 2/3 | 0.70 s |
-| 7–15 | MiniCPM-V 4.6, Qwen 3.5 0.8B, Moondream, GLM-OCR, Qwen3-VL 2B/4B, Granite, DeepSeek-OCR, Llama Vision | 0–3/9 | 0–1/3 | see report |
-
-The measured run used Ollama 0.31.2, its default Flash Attention setting (`false`), f16 KV cache, and an NVIDIA RTX A2000 8 GB Laptop GPU. Three examples are a compatibility smoke test, not a production accuracy estimate.
-
----
-
-## Prerequisites
-
-- Python 3.14.6
-- [ollama](https://ollama.com) running locally
-- The default model pulled: `ollama pull qwen3.5:4b`
-
----
-
-## Setup
+Requirements are Python 3.14.6 and a running local [Ollama](https://ollama.com) server.
 
 ```bash
 git clone https://github.com/marcelpetrick/sales-slip-scanner-ng.git
 cd sales-slip-scanner-ng
-pip install -r requirements.txt
+./localPipeline.sh
 ollama pull qwen3.5:4b
 ```
 
----
+`pyproject.toml` is the sole dependency and build definition. The pipeline creates or reuses `.venv`, installs the project with its pinned development dependencies, and runs every quality gate; no separate `requirements.txt` is needed.
 
-## Usage
-
-```bash
-# Default model (qwen3.5:4b)
-python salesSlipScanner.py
-
-# Override model
-python salesSlipScanner.py --model llama3.2-vision:11b
-```
-
-If the requested model is not installed, the script prints the exact
-`ollama pull` command needed and exits with a nonzero status. Ambiguous model
-responses and per-file failures also produce a nonzero status.
-
-Run selected benchmark models explicitly; missing models are never downloaded
-unless `--allow-downloads` is supplied, and downloads require estimated model
-space plus a 10 GB reserve on the configured Ollama storage filesystem:
+## Run the hot folder
 
 ```bash
-python localVisionModelTest/benchmark.py --model qwen3.5:4b
-python localVisionModelTest/benchmark.py --all --runs 3 --allow-downloads --fresh
+mkdir -p hot_folder
+cp ~/receipts/*.jpg hot_folder/
+./scanHotFolder.sh
 ```
 
----
+Example output:
+
+```text
+Hot folder : /repo/sales-slip-scanner-ng/hot_folder
+Report     : /repo/sales-slip-scanner-ng/hot_folder/receipt-report.md
+Model      : qwen3.5:4b
+Found 3 new receipt(s) [model: qwen3.5:4b]
+Warming model and keeping it loaded for 10m …
+  fuel.jpg … OK (79,49 €)
+  groceries-a.jpg … OK (28,41 €)
+  groceries-b.jpg … OK (10,93 €)
+
+========== Receipt Summary ==========
+Processed this run : 3
+Failed this run    : 0
+All receipts      : 3
+Grand total       : 118,83 €
+Report            : .../hot_folder/receipt-report.md
+=====================================
+```
+
+The generated report resembles:
+
+```markdown
+# Receipt Report
+
+| Receipt | Amount | Processed | SHA-256 |
+|---|---:|---|---|
+| fuel.jpg | 79,49 € | ... | `abc123...` |
+| groceries-a.jpg | 28,41 € | ... | `def456...` |
+| groceries-b.jpg | 10,93 € | ... | `789abc...` |
+
+## Grand total: 118,83 €
+```
+
+## Configuration
+
+The shell wrapper validates Python, Ollama connectivity, and exact model availability before starting. Paths and warm duration can be configured either with arguments or environment variables:
+
+```bash
+./scanHotFolder.sh --hot-folder /data/receipts --report /data/receipt-total.md
+./scanHotFolder.sh --keep-alive 30m
+
+RECEIPT_HOT_FOLDER=/data/receipts \
+RECEIPT_REPORT=/data/receipt-total.md \
+RECEIPT_KEEP_ALIVE=30m \
+./scanHotFolder.sh
+```
+
+`RECEIPT_MODEL` or `--model` can select another locally installed vision model. The default remains `qwen3.5:4b`; missing models are never downloaded implicitly.
+
+The Python entry point exposes the same options:
+
+```bash
+.venv/bin/python salesSlipScanner.py --help
+```
+
+## Ollama 0.31.2 benchmark
+
+Only the fresh Ollama 0.31.2 sweep is used for current model selection. Fifteen models were tested on three annotated receipts with three runs per image, producing 135 trials.
+
+| # | Model | Exact | Stable receipts | Warm median |
+|---:|---|---:|---:|---:|
+| 1 | **Qwen 3.5 4B** ← default | **9/9** | **3/3** | 0.46 s |
+| 2 | Ministral 3 3B | 6/9 | 2/3 | 0.32 s |
+| 3 | Qwen 3.5 2B | 6/9 | 2/3 | 0.40 s |
+| 4 | Gemma 3 4B | 6/9 | 2/3 | 0.53 s |
+| 5 | MiniCPM-V 2.6 8B | 6/9 | 2/3 | 0.68 s |
+| 6 | MiniCPM-V 4.5 8B | 6/9 | 2/3 | 0.70 s |
+
+The run used Flash Attention disabled, f16 KV cache, and an NVIDIA RTX A2000 8 GB Laptop GPU. Three source images are a compatibility smoke test, not a production accuracy estimate; full data remains in [`results.md`](localVisionModelTest/results.md), [`results.json`](localVisionModelTest/results.json), and the [one-page PDF](localVisionModelTest/results.pdf).
 
 ## Project layout
 
+```text
+hot_folder/                   runtime receipts, state, and Markdown report
+scanHotFolder.sh              robust operator entry point
+salesSlipScanner.py           hot-folder orchestration and reporting
+receipt_ocr.py                local image preparation, prompt, and parsing
+test_images/                  annotated smoke-test receipts
+localVisionModelTest/         benchmark harness and Ollama 0.31.2 results
+tests/                        offline scanner and benchmark tests
+localPipeline.sh              dependency, lint, test, and coverage gate
 ```
-input/                        ← drop receipt images here
-test_images/                  ← annotated reference images
-salesSlipScanner.py           ← main script
-receipt_ocr.py                 ← shared image, prompt, parsing, and Ollama logic
-localVisionModelTest/
-  benchmark.py                ← explicit, capacity-checked smoke-test harness
-  modelsToTest.md             ← full candidate list with VRAM / disk notes
-  results.json / .md / .pdf  ← trial data, analysis, and one-page results
-documents/
-  agents.md                   ← working agreement (commit style, pipeline gate)
-tests/
-  test_sales_slip_scanner.py  ← scanner and shared OCR tests
-  test_benchmark.py           ← offline benchmark scoring and safety tests
-localPipeline.sh              ← Python/dependencies/lint/tests/coverage with summary
-pyproject.toml                ← Python constraint and exact dependency pins
-requirements.txt              ← compatibility installer for project + dev dependencies
-```
-
----
 
 ## Development
-
-Run the full quality pipeline before committing:
 
 ```bash
 ./localPipeline.sh
 ```
 
-Stages: **Python 3.14.6 check → isolated dependency install → full-tree Ruff lint → pytest with coverage**. Every run ends with a stage-by-stage PASS/FAIL/SKIP summary, including test count and total coverage.
+The pipeline verifies Python 3.14.6, exact dependency pins, repository-wide Ruff checks, pytest, and coverage. It always finishes with a stage-by-stage summary.

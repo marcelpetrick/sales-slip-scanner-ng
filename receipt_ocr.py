@@ -36,17 +36,20 @@ def encode_image(path: Path) -> str:
         return base64.b64encode(buffer.getvalue()).decode()
 
 
-def query_model(model_id: str, image_b64: str) -> str:
+def query_model(model_id: str, image_b64: str, keep_alive: str = "10m") -> str:
     """Submit one encoded receipt to an Ollama vision model."""
     response = ollama.chat(
         model=model_id,
-        messages=[{
-            "role": "user",
-            "content": PROMPT,
-            "images": [image_b64],
-        }],
+        messages=[
+            {
+                "role": "user",
+                "content": PROMPT,
+                "images": [image_b64],
+            }
+        ],
         think=False,
         options={"temperature": 0, "num_ctx": 4096, "num_predict": 64},
+        keep_alive=keep_alive,
     )
     return response.message.content.strip()
 

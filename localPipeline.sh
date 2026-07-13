@@ -10,6 +10,8 @@ PYTHON="${VENV_DIR}/bin/python"
 SYSTEM_PYTHON="${SYSTEM_PYTHON:-python3}"
 REQUIRED_PYTHON="3.14.6"
 PIPELINE_LOG_DIR="${TMPDIR:-/tmp}/sales-slip-scanner-pipeline-$$"
+export PYTHONDONTWRITEBYTECODE=1
+export COVERAGE_FILE="${PIPELINE_LOG_DIR}/.coverage"
 
 declare -a SUMMARY_LINES=()
 
@@ -78,6 +80,12 @@ print_summary() {
     printf '============================================\n'
 }
 
+# shellcheck disable=SC2329  # Invoked by the EXIT trap in main.
+cleanup() {
+    rm -rf "${PIPELINE_LOG_DIR}" "${ROOT_DIR}/build"
+    rm -rf "${ROOT_DIR}"/*.egg-info
+}
+
 prepare_virtual_environment() {
     if [[ -x "${PYTHON}" ]]; then
         if [[ "$("${PYTHON}" -c 'import platform; print(platform.python_version())')" != \
@@ -98,7 +106,7 @@ main() {
     local exit_code=1
 
     mkdir -p "${PIPELINE_LOG_DIR}"
-    trap 'rm -rf "${PIPELINE_LOG_DIR}"' EXIT
+    trap cleanup EXIT
 
     if [[ "$("${SYSTEM_PYTHON}" -c 'import platform; print(platform.python_version())' 2>/dev/null)" == \
           "${REQUIRED_PYTHON}" ]]; then
@@ -116,11 +124,11 @@ main() {
     fi
 
     if [[ "${VENV_OK}" -eq 1 ]]; then
-        log "Installing runtime and development dependencies."
+        log "Installing project and development dependencies from pyproject.toml."
         if run_with_log "${PIPELINE_LOG_DIR}/dependencies.log" \
-            "${PYTHON}" -m pip install --quiet -r "${ROOT_DIR}/requirements.txt"; then
+            "${PYTHON}" -m pip install --quiet "${ROOT_DIR}[dev]"; then
             INSTALL_OK=1
-            mark_result "Dependencies" "PASS" "requirements.txt installed"
+            mark_result "Dependencies" "PASS" "pyproject.toml installed"
         else
             mark_result "Dependencies" "FAIL" "Dependency installation failed"
         fi
@@ -130,7 +138,8 @@ main() {
 
     if [[ "${INSTALL_OK}" -eq 1 ]]; then
         log "Running Ruff across all repository Python code."
-        if run_with_log "${PIPELINE_LOG_DIR}/ruff.log" "${PYTHON}" -m ruff check "${ROOT_DIR}"; then
+        if run_with_log "${PIPELINE_LOG_DIR}/ruff.log" \
+            "${PYTHON}" -m ruff check --no-cache "${ROOT_DIR}"; then
             LINT_OK=1
             ruff_details="$(extract_ruff_details "${PIPELINE_LOG_DIR}/ruff.log")"
             mark_result "Ruff" "PASS" "${ruff_details}"
@@ -142,12 +151,12 @@ main() {
         log "Running pytest with coverage."
         if run_with_log "${PIPELINE_LOG_DIR}/pytest.log" \
             "${PYTHON}" -m pytest "${ROOT_DIR}/tests" \
+            -p no:cacheprovider \
             --tb=short \
             -q \
             --cov=salesSlipScanner \
             --cov=receipt_ocr \
             --cov-report=term-missing \
-            --cov-report="html:${ROOT_DIR}/coverage_html" \
             --cov-fail-under=80; then
             TESTS_OK=1
             test_details="$(extract_test_details "${PIPELINE_LOG_DIR}/pytest.log")"

@@ -1,6 +1,10 @@
-coverage_html/
-__pycache__/
-.coverage
-.venv/
-build/
+/hot_folder/
+/.coverage
+/.pytest_cache/
+/.ruff_cache/
+/.venv/
+/build/
+/coverage_html/
 *.egg-info/
+__pycache__/
+*.py[cod]

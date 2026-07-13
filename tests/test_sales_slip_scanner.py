@@ -1,11 +1,8 @@
-"""Unit tests for salesSlipScanner.py.
-
-All external I/O (ollama, filesystem rename) is mocked so the suite runs
-offline without any model installed.
-"""
+"""Offline tests for the local hot-folder receipt workflow."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,473 +10,286 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
-import salesSlipScanner as sss
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+import receipt_ocr
+import salesSlipScanner as scanner
 
 
-def make_jpeg(path: Path, width: int = 100, height: int = 80) -> Path:
-    """Create a minimal solid-colour JPEG at *path* and return *path*."""
-    img = Image.new("RGB", (width, height), color=(200, 100, 50))
-    img.save(path, format="JPEG")
+def make_image(path: Path, color=(200, 100, 50)) -> Path:
+    """Create a small valid receipt-like image fixture."""
+    Image.new("RGB", (100, 80), color=color).save(path)
     return path
 
 
-def fake_ollama_list(*model_ids: str):
-    """Return a callable that mimics ``ollama.list()`` for the given IDs."""
-    models = [SimpleNamespace(model=m) for m in model_ids]
+def model_list(*names: str) -> MagicMock:
+    models = [SimpleNamespace(model=name) for name in names]
     return MagicMock(return_value=SimpleNamespace(models=models))
 
 
-def fake_ollama_chat(content: str):
-    """Return a callable that mimics ``ollama.chat()`` returning *content*."""
-    msg = SimpleNamespace(content=content)
-    resp = SimpleNamespace(message=msg)
-    return MagicMock(return_value=resp)
+def chat_response(content: str) -> MagicMock:
+    return MagicMock(
+        return_value=SimpleNamespace(message=SimpleNamespace(content=content))
+    )
 
 
-# ===========================================================================
-# parse_price
-# ===========================================================================
+def receipt(file_name: str, digest: str, cents: int) -> dict:
+    return {
+        "file": file_name,
+        "sha256": digest,
+        "price_cents": cents,
+        "model": scanner.DEFAULT_MODEL,
+        "response": f"{cents // 100},{cents % 100:02d}",
+        "processed_at": "2026-07-13T12:00:00+00:00",
+    }
 
 
-class TestParsePrice:
-    def test_standard_comma(self):
-        assert sss.parse_price("79,49") == 7949
+def test_default_is_measured_local_model():
+    assert scanner.DEFAULT_MODEL == "qwen3.5:4b"
 
-    def test_dot_decimal(self):
-        assert sss.parse_price("79.49") == 7949
 
-    def test_euro_prefix(self):
-        assert sss.parse_price("€79,49") is None
+def test_list_local_models_returns_exact_tags():
+    with patch.object(scanner.ollama, "list", model_list("qwen3.5:4b", "gemma3:4b")):
+        assert scanner.list_local_models() == ["qwen3.5:4b", "gemma3:4b"]
 
-    def test_euro_suffix_with_space(self):
-        assert sss.parse_price("79,49 €") is None
 
-    def test_embedded_in_sentence(self):
-        assert sss.parse_price("Summe: 28,41 EUR") is None
+def test_unreachable_ollama_becomes_clear_runtime_error():
+    with patch.object(scanner.ollama, "list", side_effect=ConnectionError("offline")):
+        with pytest.raises(RuntimeError, match="Cannot reach Ollama"):
+            scanner.list_local_models()
 
-    def test_leading_whitespace(self):
-        assert sss.parse_price("  10,93  ") == 1093
 
-    def test_one_euro(self):
-        assert sss.parse_price("1,00") == 100
-
-    def test_sub_euro(self):
-        assert sss.parse_price("0,99") == 99
-
-    def test_three_digit_euros(self):
-        assert sss.parse_price("100,00") == 10000
-
-    def test_nan_string(self):
-        assert sss.parse_price("NaN") is None
-
-    def test_empty_string(self):
-        assert sss.parse_price("") is None
-
-    def test_no_digits(self):
-        assert sss.parse_price("no number here") is None
-
-    def test_only_one_decimal_digit(self):
-        # "7,4" has only 1 decimal digit — must not match (\d{2} required)
-        assert sss.parse_price("7,4") is None
-
-    def test_three_decimal_digits_not_matched(self):
-        assert sss.parse_price("7,449") is None
-
-    def test_multiple_amounts_rejected(self):
-        assert sss.parse_price("12,00 79,49") is None
-
-
-# ===========================================================================
-# build_renamed_path
-# ===========================================================================
-
-
-class TestBuildRenamedPath:
-    def test_jpg(self):
-        p = Path("/input/receipt.jpg")
-        assert sss.build_renamed_path(p, 7949) == Path("/input/receipt_7949.jpg")
-
-    def test_png(self):
-        p = Path("/input/slip.png")
-        assert sss.build_renamed_path(p, 2841) == Path("/input/slip_2841.png")
-
-    def test_jpeg_extension_preserved(self):
-        p = Path("/input/scan.jpeg")
-        assert sss.build_renamed_path(p, 1093) == Path("/input/scan_1093.jpeg")
-
-    def test_zero_cents(self):
-        p = Path("/input/free.jpg")
-        assert sss.build_renamed_path(p, 0) == Path("/input/free_0.jpg")
-
-    def test_parent_directory_preserved(self):
-        p = Path("/some/deep/dir/receipt.jpg")
-        result = sss.build_renamed_path(p, 500)
-        assert result.parent == Path("/some/deep/dir")
-
-    def test_stem_unchanged(self):
-        p = Path("/input/my_receipt.jpg")
-        result = sss.build_renamed_path(p, 999)
-        assert result.name == "my_receipt_999.jpg"
-
-
-# ===========================================================================
-# manifest
-# ===========================================================================
-
-
-class TestManifest:
-    def test_missing_manifest_returns_empty_structure(self, tmp_path):
-        assert sss.load_manifest(tmp_path) == {"version": 1, "receipts": []}
-
-    def test_manifest_round_trip(self, tmp_path):
-        manifest = {
-            "version": 1,
-            "receipts": [{"source": "a.jpg", "file": "a_99.jpg"}],
-        }
-        sss.save_manifest(tmp_path, manifest)
-        assert sss.load_manifest(tmp_path) == manifest
-
-    def test_invalid_manifest_is_rejected(self, tmp_path):
-        (tmp_path / sss.MANIFEST_NAME).write_text('{"version": 2}', encoding="utf-8")
-        with pytest.raises(ValueError, match="Invalid processing manifest"):
-            sss.load_manifest(tmp_path)
-
-
-# ===========================================================================
-# collect_input_files
-# ===========================================================================
-
-
-class TestCollectInputFiles:
-    def test_empty_directory(self, tmp_path):
-        assert sss.collect_input_files(tmp_path) == []
-
-    def test_missing_directory_raises(self, tmp_path):
-        missing = tmp_path / "nonexistent"
-        with pytest.raises(FileNotFoundError):
-            sss.collect_input_files(missing)
-
-    def test_jpg_picked_up(self, tmp_path):
-        make_jpeg(tmp_path / "a.jpg")
-        files = sss.collect_input_files(tmp_path)
-        assert len(files) == 1
-        assert files[0].name == "a.jpg"
-
-    def test_jpeg_picked_up(self, tmp_path):
-        make_jpeg(tmp_path / "b.jpeg")
-        assert len(sss.collect_input_files(tmp_path)) == 1
-
-    def test_png_picked_up(self, tmp_path):
-        img = Image.new("RGB", (10, 10))
-        img.save(tmp_path / "c.png")
-        assert len(sss.collect_input_files(tmp_path)) == 1
-
-    def test_unsupported_extensions_ignored(self, tmp_path):
-        (tmp_path / "doc.pdf").write_bytes(b"%PDF")
-        (tmp_path / "note.txt").write_text("hello")
-        assert sss.collect_input_files(tmp_path) == []
-
-    def test_already_processed_excluded(self, tmp_path):
-        make_jpeg(tmp_path / "slip_7949.jpg")
-        assert sss.collect_input_files(tmp_path, {"slip_7949.jpg"}) == []
-
-    def test_mix_processed_and_unprocessed(self, tmp_path):
-        make_jpeg(tmp_path / "new.jpg")
-        make_jpeg(tmp_path / "old_7949.jpg")
-        files = sss.collect_input_files(tmp_path, {"old_7949.jpg"})
-        assert len(files) == 1
-        assert files[0].name == "new.jpg"
-
-    def test_numeric_filename_is_not_assumed_processed(self, tmp_path):
-        make_jpeg(tmp_path / "receipt_2024.jpg")
-        assert sss.collect_input_files(tmp_path) == [tmp_path / "receipt_2024.jpg"]
-
-    def test_sorted_order(self, tmp_path):
-        make_jpeg(tmp_path / "c.jpg")
-        make_jpeg(tmp_path / "a.jpg")
-        make_jpeg(tmp_path / "b.jpg")
-        names = [f.name for f in sss.collect_input_files(tmp_path)]
-        assert names == ["a.jpg", "b.jpg", "c.jpg"]
-
-    def test_subdirectories_not_traversed(self, tmp_path):
-        sub = tmp_path / "sub"
-        sub.mkdir()
-        make_jpeg(sub / "nested.jpg")
-        assert sss.collect_input_files(tmp_path) == []
-
-
-# ===========================================================================
-# load_and_encode_image
-# ===========================================================================
-
-
-class TestLoadAndEncodeImage:
-    def test_returns_base64_string(self, tmp_path):
-        p = make_jpeg(tmp_path / "img.jpg")
-        result = sss.load_and_encode_image(p)
-        assert isinstance(result, str)
-        assert len(result) > 0
-
-    def test_small_image_not_resized(self, tmp_path):
-        p = make_jpeg(tmp_path / "small.jpg", width=100, height=80)
-        # Should succeed without error
-        result = sss.load_and_encode_image(p)
-        assert result
-
-    def test_large_image_encoded(self, tmp_path):
-        # Image wider than MAX_SIDE_PX — should still encode (after resize)
-        p = make_jpeg(tmp_path / "big.jpg", width=3000, height=2000)
-        result = sss.load_and_encode_image(p)
-        assert result
-
-    def test_output_is_valid_jpeg_when_decoded(self, tmp_path):
-        import base64
-        p = make_jpeg(tmp_path / "img.jpg")
-        encoded = sss.load_and_encode_image(p)
-        raw = base64.b64decode(encoded)
-        # JPEG magic bytes
-        assert raw[:2] == b"\xff\xd8"
-
-
-# ===========================================================================
-# list_local_models / ensure_model_available
-# ===========================================================================
-
-
-class TestListLocalModels:
-    def test_returns_model_ids(self):
-        with patch("salesSlipScanner.ollama.list", fake_ollama_list("llava:7b", "moondream")):
-            result = sss.list_local_models()
-        assert result == ["llava:7b", "moondream"]
-
-    def test_raises_on_connection_error(self):
-        with patch("salesSlipScanner.ollama.list", side_effect=Exception("refused")):
-            with pytest.raises(RuntimeError, match="Cannot reach ollama"):
-                sss.list_local_models()
-
-
-class TestEnsureModelAvailable:
-    def test_exact_match_passes(self):
-        with patch("salesSlipScanner.ollama.list", fake_ollama_list("qwen3-vl:4b")):
-            sss.ensure_model_available("qwen3-vl:4b")  # must not raise
-
-    def test_different_tag_is_rejected(self):
-        with patch("salesSlipScanner.ollama.list", fake_ollama_list("qwen3-vl:4b-fp16")):
-            with pytest.raises(SystemExit):
-                sss.ensure_model_available("qwen3-vl:4b")
-
-    def test_implicit_latest_tag_passes(self):
-        with patch("salesSlipScanner.ollama.list", fake_ollama_list("moondream:latest")):
-            sss.ensure_model_available("moondream")
-
-    def test_absent_model_exits(self, capsys):
-        with patch("salesSlipScanner.ollama.list", fake_ollama_list("moondream")):
-            with pytest.raises(SystemExit) as exc:
-                sss.ensure_model_available("llava:7b")
-        assert exc.value.code == 1
-        err = capsys.readouterr().err
-        assert "ollama pull llava:7b" in err
-
-    def test_no_models_installed(self, capsys):
-        with patch("salesSlipScanner.ollama.list", fake_ollama_list()):
-            with pytest.raises(SystemExit):
-                sss.ensure_model_available("llava:7b")
-        err = capsys.readouterr().err
-        assert "(none)" in err
-
-
-# ===========================================================================
-# query_ollama
-# ===========================================================================
-
-
-class TestQueryOllama:
-    def test_returns_stripped_content(self):
-        with patch("salesSlipScanner.ollama.chat", fake_ollama_chat("  79,49  ")):
-            result = sss.query_ollama("some-model", "b64data")
-        assert result == "79,49"
-
-    def test_uses_benchmarked_deterministic_options(self):
-        chat = fake_ollama_chat("79,49")
-        with patch("salesSlipScanner.ollama.chat", chat):
-            sss.query_ollama("some-model", "b64data")
-        assert chat.call_args.kwargs["think"] is False
-        assert chat.call_args.kwargs["options"] == {
-            "temperature": 0,
-            "num_ctx": 4096,
-            "num_predict": 64,
-        }
-
-    def test_propagates_exception(self):
-        with patch("salesSlipScanner.ollama.chat", side_effect=RuntimeError("timeout")):
-            with pytest.raises(RuntimeError):
-                sss.query_ollama("model", "b64")
-
-
-# ===========================================================================
-# process_file
-# ===========================================================================
-
-
-class TestProcessFile:
-    def test_success_renames_file(self, tmp_path):
-        img = make_jpeg(tmp_path / "receipt.jpg")
-        with patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", return_value="79,49"):
-            price = sss.process_file(img, "model")
-        assert price == 7949
-        assert not img.exists()
-        assert (tmp_path / "receipt_7949.jpg").exists()
-
-    def test_nan_response_skips_rename(self, tmp_path):
-        img = make_jpeg(tmp_path / "unknown.jpg")
-        with patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", return_value="NaN"):
-            price = sss.process_file(img, "model")
-        assert price is None
-        assert img.exists()  # file must not be renamed
-
-    def test_ocr_exception_returns_none(self, tmp_path):
-        img = make_jpeg(tmp_path / "broken.jpg")
-        with patch("salesSlipScanner.load_and_encode_image", side_effect=OSError("fail")):
-            price = sss.process_file(img, "model")
-        assert price is None
-        assert img.exists()
-
-    def test_existing_target_is_never_replaced(self, tmp_path):
-        img = make_jpeg(tmp_path / "receipt.jpg")
-        existing = tmp_path / "receipt_7949.jpg"
-        existing.write_bytes(b"keep me")
-        with patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", return_value="79,49"):
-            price = sss.process_file(img, "model")
-        assert price is None
-        assert img.exists()
-        assert existing.read_bytes() == b"keep me"
-
-    def test_correct_price_in_cents(self, tmp_path):
-        img = make_jpeg(tmp_path / "slip.jpg")
-        with patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", return_value="10,93"):
-            price = sss.process_file(img, "model")
-        assert price == 1093
-        assert (tmp_path / "slip_1093.jpg").exists()
-
-
-# ===========================================================================
-# run
-# ===========================================================================
-
-
-class TestRun:
-    def _patch_model(self, model_id=sss.DEFAULT_MODEL):
-        return patch(
-            "salesSlipScanner.ollama.list",
-            fake_ollama_list(model_id),
-        )
-
-    def test_empty_input_returns_zero_summary(self, tmp_path):
-        with self._patch_model():
-            summary = sss.run(input_dir=tmp_path)
-        assert summary == {"processed": 0, "skipped": 0, "total_cents": 0, "results": []}
-
-    def test_model_not_available_exits(self, tmp_path):
-        with patch("salesSlipScanner.ollama.list", fake_ollama_list("other-model")):
-            with pytest.raises(SystemExit):
-                sss.run(model_id="missing-model", input_dir=tmp_path)
-
-    def test_single_file_processed(self, tmp_path):
-        make_jpeg(tmp_path / "a.jpg")
-        with self._patch_model(), \
-             patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", return_value="79,49"):
-            summary = sss.run(input_dir=tmp_path)
-        assert summary["processed"] == 1
-        assert summary["skipped"] == 0
-        assert summary["total_cents"] == 7949
-
-    def test_multiple_files_summed(self, tmp_path):
-        make_jpeg(tmp_path / "a.jpg")
-        make_jpeg(tmp_path / "b.jpg")
-        responses = iter(["79,49", "28,41"])
-        with self._patch_model(), \
-             patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", side_effect=responses):
-            summary = sss.run(input_dir=tmp_path)
-        assert summary["processed"] == 2
-        assert summary["total_cents"] == 7949 + 2841
-
-    def test_failed_file_counted_as_skipped(self, tmp_path):
-        make_jpeg(tmp_path / "x.jpg")
-        with self._patch_model(), \
-             patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", return_value="NaN"):
-            summary = sss.run(input_dir=tmp_path)
-        assert summary["processed"] == 0
-        assert summary["skipped"] == 1
-        assert summary["total_cents"] == 0
-
-    def test_mix_of_success_and_failure(self, tmp_path):
-        make_jpeg(tmp_path / "a.jpg")
-        make_jpeg(tmp_path / "b.jpg")
-        responses = iter(["10,93", "NaN"])
-        with self._patch_model(), \
-             patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", side_effect=responses):
-            summary = sss.run(input_dir=tmp_path)
-        assert summary["processed"] == 1
-        assert summary["skipped"] == 1
-        assert summary["total_cents"] == 1093
-
-    def test_success_is_recorded_and_not_reprocessed(self, tmp_path):
-        make_jpeg(tmp_path / "a.jpg")
-        with self._patch_model(), \
-             patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
-             patch("salesSlipScanner.query_ollama", return_value="0,99"):
-            first = sss.run(input_dir=tmp_path)
-            second = sss.run(input_dir=tmp_path)
-        assert first["processed"] == 1
-        assert second["processed"] == 0
-        manifest = sss.load_manifest(tmp_path)
-        assert manifest["receipts"][0]["file"] == "a_99.jpg"
-
-    def test_missing_input_dir_raises(self):
-        missing = Path("/tmp/does_not_exist_xyzzy")
-        with patch(
-            "salesSlipScanner.ollama.list", fake_ollama_list(sss.DEFAULT_MODEL)
-        ):
-            with pytest.raises(FileNotFoundError):
-                sss.run(input_dir=missing)
-
-
-# ===========================================================================
-# parse_args
-# ===========================================================================
-
-
-class TestParseArgs:
-    def test_default_model(self):
-        args = sss.parse_args([])
-        assert args.model == sss.DEFAULT_MODEL
-
-    def test_custom_model_flag(self):
-        args = sss.parse_args(["--model", "llama3.2-vision:11b"])
-        assert args.model == "llama3.2-vision:11b"
-
-    def test_unknown_flag_exits(self):
+def test_missing_model_exits_with_pull_command(capsys):
+    with patch.object(scanner.ollama, "list", model_list("other:latest")):
         with pytest.raises(SystemExit):
-            sss.parse_args(["--unknown-flag"])
+            scanner.ensure_model_available(scanner.DEFAULT_MODEL)
+    assert f"ollama pull {scanner.DEFAULT_MODEL}" in capsys.readouterr().err
 
 
-class TestMain:
-    def test_success_returns_zero(self):
-        with patch("salesSlipScanner.run", return_value={"skipped": 0}):
-            assert sss.main([]) == 0
+def test_warm_model_uses_requested_keep_alive():
+    with patch.object(scanner.ollama, "generate") as generate:
+        scanner.warm_model("model", "15m")
+    assert generate.call_args.kwargs["keep_alive"] == "15m"
+    assert generate.call_args.kwargs["options"]["num_ctx"] == 4096
 
-    def test_partial_failure_returns_nonzero(self):
-        with patch("salesSlipScanner.run", return_value={"skipped": 1}):
-            assert sss.main([]) == 1
+
+def test_warm_failure_has_model_context():
+    with patch.object(scanner.ollama, "generate", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError, match="Could not warm.*model"):
+            scanner.warm_model("model", "10m")
+
+
+def test_query_model_uses_deterministic_warm_options():
+    chat = chat_response(" 79,49 ")
+    with patch.object(receipt_ocr.ollama, "chat", chat):
+        assert receipt_ocr.query_model("model", "image", "12m") == "79,49"
+    options = chat.call_args.kwargs
+    assert options["think"] is False
+    assert options["keep_alive"] == "12m"
+    assert options["options"] == {
+        "temperature": 0,
+        "num_ctx": 4096,
+        "num_predict": 64,
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("79,49", 7949), ("10.93", 1093), ("€28,41", None), ("10,00 20,00", None)],
+)
+def test_strict_price_parsing(raw, expected):
+    assert receipt_ocr.parse_price(raw) == expected
+
+
+def test_image_encoding_resizes_large_input(tmp_path):
+    image = tmp_path / "large.png"
+    Image.new("RGB", (3000, 1500), color="white").save(image)
+    assert isinstance(receipt_ocr.encode_image(image), str)
+
+
+def test_file_hash_changes_with_content(tmp_path):
+    path = tmp_path / "receipt.jpg"
+    path.write_bytes(b"first")
+    first = scanner.file_sha256(path)
+    path.write_bytes(b"second")
+    assert scanner.file_sha256(path) != first
+
+
+def test_missing_state_is_empty(tmp_path):
+    assert scanner.load_state(tmp_path) == scanner.empty_state()
+
+
+def test_state_round_trip_is_atomic(tmp_path):
+    state = scanner.empty_state()
+    state["receipts"].append(receipt("a.jpg", "a" * 64, 1093))
+    scanner.save_state(tmp_path, state)
+    assert scanner.load_state(tmp_path) == state
+    assert not list(tmp_path.glob(f"{scanner.STATE_NAME}.*"))
+
+
+def test_obsolete_rename_manifest_is_rejected(tmp_path):
+    (tmp_path / scanner.STATE_NAME).write_text(
+        json.dumps({"version": 1, "receipts": []}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="obsolete"):
+        scanner.load_state(tmp_path)
+
+
+def test_collect_pending_filters_extensions_and_content_duplicates(tmp_path):
+    first = make_image(tmp_path / "b.jpg")
+    duplicate = tmp_path / "a.jpg"
+    duplicate.write_bytes(first.read_bytes())
+    make_image(tmp_path / "c.png", color=(1, 2, 3))
+    (tmp_path / "notes.txt").write_text("ignore", encoding="utf-8")
+    pending = scanner.collect_pending(tmp_path, set())
+    assert [path.name for path, _ in pending] == ["a.jpg", "c.png"]
+
+
+def test_collect_pending_skips_successful_fingerprint(tmp_path):
+    image = make_image(tmp_path / "receipt.jpg")
+    assert scanner.collect_pending(tmp_path, {scanner.file_sha256(image)}) == []
+
+
+def test_markdown_report_contains_receipts_total_and_failures():
+    state = scanner.empty_state()
+    state["receipts"] = [
+        receipt("shop|one.jpg", "a" * 64, 7949),
+        receipt("fuel.jpg", "b" * 64, 2841),
+    ]
+    state["last_failures"] = [{"file": "bad.jpg", "error": "not readable"}]
+    with patch.object(scanner, "utc_now", return_value="NOW"):
+        report = scanner.render_report(state, scanner.DEFAULT_MODEL)
+    assert "shop\\|one.jpg" in report
+    assert "79,49 €" in report
+    assert "## Grand total: 107,90 €" in report
+    assert "bad.jpg" in report
+    assert scanner.DEFAULT_MODEL in report
+
+
+def test_empty_markdown_report_has_zero_total():
+    with patch.object(scanner, "utc_now", return_value="NOW"):
+        report = scanner.render_report(scanner.empty_state(), scanner.DEFAULT_MODEL)
+    assert "No successful receipts" in report
+    assert "Grand total: 0,00 €" in report
+
+
+def test_process_file_success_does_not_mutate_source(tmp_path):
+    image = make_image(tmp_path / "receipt.jpg")
+    original = image.read_bytes()
+    with (
+        patch.object(scanner, "encode_image", return_value="encoded"),
+        patch.object(scanner, "query_model", return_value="28,41") as query,
+        patch.object(scanner, "utc_now", return_value="NOW"),
+    ):
+        result = scanner.process_file(image, "a" * 64, "model", "10m")
+    assert result["price_cents"] == 2841
+    assert image.read_bytes() == original
+    query.assert_called_once_with("model", "encoded", keep_alive="10m")
+
+
+def test_process_file_rejects_unparseable_response(tmp_path):
+    image = make_image(tmp_path / "receipt.jpg")
+    with (
+        patch.object(scanner, "encode_image", return_value="encoded"),
+        patch.object(scanner, "query_model", return_value="EUR 28,41"),
+    ):
+        result = scanner.process_file(image, "a" * 64, "model", "10m")
+    assert "unparseable" in result["error"]
+    assert image.exists()
+
+
+def test_process_file_captures_inference_error(tmp_path):
+    image = make_image(tmp_path / "receipt.jpg")
+    with patch.object(scanner, "encode_image", side_effect=OSError("broken")):
+        result = scanner.process_file(image, "a" * 64, "model", "10m")
+    assert result["error"] == "OSError: broken"
+
+
+def test_empty_hot_folder_is_created_with_report_and_state(tmp_path):
+    hot = tmp_path / "new-hot-folder"
+    with patch.object(scanner, "ensure_model_available"):
+        result = scanner.run(input_dir=hot)
+    assert result["receipt_count"] == 0
+    assert (hot / scanner.REPORT_NAME).exists()
+    assert (hot / scanner.STATE_NAME).exists()
+
+
+def test_run_processes_sequentially_and_accumulates_total(tmp_path):
+    first = make_image(tmp_path / "a.jpg")
+    second = make_image(tmp_path / "b.jpg", color=(1, 2, 3))
+    first_bytes, second_bytes = first.read_bytes(), second.read_bytes()
+    responses = iter(["79,49", "28,41"])
+    with (
+        patch.object(scanner, "ensure_model_available"),
+        patch.object(scanner, "warm_model") as warm,
+        patch.object(
+            scanner, "query_model", side_effect=lambda *_args, **_kw: next(responses)
+        ),
+    ):
+        result = scanner.run(input_dir=tmp_path, keep_alive="20m")
+    assert result["processed"] == 2
+    assert result["total_cents"] == 10790
+    assert first.read_bytes() == first_bytes
+    assert second.read_bytes() == second_bytes
+    assert len(scanner.load_state(tmp_path)["receipts"]) == 2
+    assert "Grand total: 107,90 €" in (tmp_path / scanner.REPORT_NAME).read_text()
+    warm.assert_called_once_with(scanner.DEFAULT_MODEL, "20m")
+
+
+def test_successful_content_is_not_processed_twice(tmp_path):
+    make_image(tmp_path / "receipt.jpg")
+    with (
+        patch.object(scanner, "ensure_model_available"),
+        patch.object(scanner, "warm_model"),
+        patch.object(scanner, "query_model", return_value="10,93") as query,
+    ):
+        first = scanner.run(input_dir=tmp_path)
+        second = scanner.run(input_dir=tmp_path)
+    assert first["processed"] == 1
+    assert second["processed"] == 0
+    assert second["total_cents"] == 1093
+    assert query.call_count == 1
+
+
+def test_failed_receipt_is_retried_next_run(tmp_path):
+    make_image(tmp_path / "receipt.jpg")
+    with (
+        patch.object(scanner, "ensure_model_available"),
+        patch.object(scanner, "warm_model"),
+        patch.object(scanner, "query_model", side_effect=["NaN", "10,93"]),
+    ):
+        failed = scanner.run(input_dir=tmp_path)
+        succeeded = scanner.run(input_dir=tmp_path)
+    assert failed["failed"] == 1
+    assert succeeded["processed"] == 1
+    assert scanner.load_state(tmp_path)["last_failures"] == []
+
+
+def test_cli_defaults_to_hot_folder_and_winner():
+    args = scanner.parse_args([])
+    assert args.model == scanner.DEFAULT_MODEL
+    assert args.hot_folder == scanner.HOT_FOLDER
+    assert args.keep_alive == scanner.KEEP_ALIVE
+
+
+def test_cli_accepts_paths_and_keep_alive(tmp_path):
+    args = scanner.parse_args(
+        [
+            "--hot-folder",
+            str(tmp_path),
+            "--report",
+            str(tmp_path / "report.md"),
+            "--keep-alive",
+            "30m",
+        ]
+    )
+    assert args.report == tmp_path / "report.md"
+    assert args.keep_alive == "30m"
+
+
+def test_main_returns_nonzero_for_current_failure():
+    with patch.object(scanner, "run", return_value={"failed": 1}):
+        assert scanner.main([]) == 1
+
+
+def test_main_returns_zero_for_success():
+    with patch.object(scanner, "run", return_value={"failed": 0}):
+        assert scanner.main([]) == 0

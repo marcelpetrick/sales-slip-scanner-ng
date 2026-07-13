@@ -1,3 +1,0 @@
-# Compatibility entry point for existing setup instructions.
-# Exact runtime and development pins live in pyproject.toml.
-.[dev]

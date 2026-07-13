@@ -1,382 +1,324 @@
 #!/usr/bin/env python3
-"""
-Sales Slip Scanner
-==================
-OCR German grocery / gas receipts using a local ollama vision model.
+"""Process receipt images from a local hot folder with an Ollama vision model.
 
-Usage
------
-    python salesSlipScanner.py [--model MODEL_NAME]
-
-Drop image files (JPEG, PNG, GIF) into the ``input/`` directory next to this
-script, then run it.  Each file whose total is successfully extracted gets
-renamed to include the detected price before its extension::
-
-    receipt.jpg  →  receipt_7949.jpg   (79,49 €)
-
-A human-readable summary is printed at the end showing every file and the
-grand total of all detected expenses.
-
-Model selection
----------------
-The default model is the best-performing compact model from the local
-benchmark (see localVisionModelTest/results.pdf).  Pass ``--model`` to
-override:
-
-    python salesSlipScanner.py --model llama3.2-vision:11b
-
-If the chosen model is not installed in the local ollama instance the script
-exits immediately with an instructive error message including the install
-command.
+Images are never renamed, moved, or deleted. Successful receipt fingerprints
+are recorded in an atomic state file, and a Markdown report contains every
+detected amount plus the cumulative grand total.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import ollama
 
-from receipt_ocr import encode_image, model_id_is_available, parse_price, query_model
+from receipt_ocr import (
+    encode_image,
+    format_price,
+    model_id_is_available,
+    parse_price,
+    query_model,
+)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent
+DEFAULT_MODEL = "qwen3.5:4b"
+HOT_FOLDER = ROOT / "hot_folder"
+REPORT_NAME = "receipt-report.md"
+STATE_NAME = ".sales-slip-scanner.json"
+STATE_VERSION = 2
+KEEP_ALIVE = "10m"
+SUPPORTED_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
 
-#: Best accuracy/size balance from the local benchmark (100 %, 3.3 GB).
-DEFAULT_MODEL: str = "qwen3.5:4b"
 
-#: Directory where users drop files to be processed.
-INPUT_DIR: Path = Path(__file__).parent / "input"
-
-#: Image file extensions that will be picked up.
-SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".gif"})
-
-#: Audit log used to distinguish scanner output from ordinary numeric filenames.
-MANIFEST_NAME: str = ".sales-slip-scanner.json"
-
-# ---------------------------------------------------------------------------
-# Ollama helpers
-# ---------------------------------------------------------------------------
+def utc_now() -> str:
+    """Return an ISO-8601 UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def list_local_models() -> list[str]:
-    """Return all model IDs currently installed in the local ollama instance.
-
-    Raises:
-        RuntimeError: If the ollama server cannot be reached.
-    """
+    """Return exact model IDs installed on the reachable Ollama server."""
     try:
-        return [m.model for m in ollama.list().models]
+        return [model.model for model in ollama.list().models]
     except Exception as exc:
-        raise RuntimeError(f"Cannot reach ollama server: {exc}") from exc
+        raise RuntimeError(f"Cannot reach Ollama server: {exc}") from exc
 
 
 def ensure_model_available(model_id: str) -> None:
-    """Assert that *model_id* is installed locally; exit with an error if not.
-
-    Args:
-        model_id: The ollama model identifier to verify.
-
-    Raises:
-        SystemExit: With exit code 1 when the model is absent.
-        RuntimeError: When the ollama server is unreachable.
-    """
+    """Exit with installation guidance when the requested model is absent."""
     available = list_local_models()
-    if not model_id_is_available(model_id, available):
-        print(f"Error: model '{model_id}' is not installed in ollama.", file=sys.stderr)
-        print(
-            f"  Available: {', '.join(available) if available else '(none)'}",
-            file=sys.stderr,
+    if model_id_is_available(model_id, available):
+        return
+    print(f"Error: model '{model_id}' is not installed in Ollama.", file=sys.stderr)
+    print(
+        f"  Available: {', '.join(available) if available else '(none)'}",
+        file=sys.stderr,
+    )
+    print(f"  Install:   ollama pull {model_id}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def warm_model(model_id: str, keep_alive: str) -> None:
+    """Load the model before the first receipt and retain it after the batch."""
+    try:
+        ollama.generate(
+            model=model_id,
+            prompt="",
+            keep_alive=keep_alive,
+            options={"temperature": 0, "num_ctx": 4096, "num_predict": 1},
         )
-        print(f"  Install:   ollama pull {model_id}", file=sys.stderr)
-        sys.exit(1)
+    except Exception as exc:
+        raise RuntimeError(f"Could not warm Ollama model '{model_id}': {exc}") from exc
 
 
-# ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
+def file_sha256(path: Path) -> str:
+    """Hash a file without loading it entirely into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def load_and_encode_image(path: Path) -> str:
-    """Open an image, resize it, and return a base64-encoded JPEG string.
-
-    The image is resized so its longest side is at most *MAX_SIDE_PX* pixels
-    (aspect ratio preserved).  Smaller images pass through unchanged.
-
-    Args:
-        path: Path to the source image file.
-
-    Returns:
-        Base64-encoded JPEG data (no ``data:`` URI prefix).
-    """
-    return encode_image(path)
+def empty_state() -> dict:
+    """Return a new scanner state document."""
+    return {"version": STATE_VERSION, "receipts": [], "last_failures": []}
 
 
-def collect_input_files(
-    directory: Path,
-    processed_names: set[str] | None = None,
-) -> list[Path]:
-    """Collect all unprocessed, supported image files in *directory*.
-
-    Subdirectories are not traversed. Files recorded in the audit manifest
-    are skipped; ordinary filenames ending in digits remain valid inputs.
-
-    Args:
-        directory: The directory to scan (must exist).
-
-    Returns:
-        Sorted list of ``Path`` objects ready for processing.
-
-    Raises:
-        FileNotFoundError: If *directory* does not exist.
-    """
-    if not directory.exists():
-        raise FileNotFoundError(f"Input directory not found: {directory}")
-    return sorted(
-        p
-        for p in directory.iterdir()
-        if p.is_file()
-        and p.suffix.lower() in SUPPORTED_EXTENSIONS
-        and p.name not in (processed_names or set())
-    )
-
-
-def load_manifest(directory: Path) -> dict:
-    """Load and validate the directory's processing audit manifest."""
-    path = directory / MANIFEST_NAME
+def load_state(directory: Path) -> dict:
+    """Load and strictly validate the hot folder's scanner state."""
+    path = directory / STATE_NAME
     if not path.exists():
-        return {"version": 1, "receipts": []}
+        return empty_state()
     with path.open(encoding="utf-8") as stream:
-        manifest = json.load(stream)
-    receipts = manifest.get("receipts")
-    entries_are_valid = isinstance(receipts, list) and all(
-        isinstance(entry, dict) and isinstance(entry.get("file"), str)
-        for entry in receipts
+        state = json.load(stream)
+    receipts = state.get("receipts")
+    failures = state.get("last_failures")
+    receipts_valid = isinstance(receipts, list) and all(
+        isinstance(item, dict)
+        and isinstance(item.get("file"), str)
+        and isinstance(item.get("sha256"), str)
+        and isinstance(item.get("price_cents"), int)
+        for item in receipts
     )
-    if manifest.get("version") != 1 or not entries_are_valid:
-        raise ValueError(f"Invalid processing manifest: {path}")
-    return manifest
+    failures_valid = isinstance(failures, list) and all(
+        isinstance(item, dict)
+        and isinstance(item.get("file"), str)
+        and isinstance(item.get("error"), str)
+        for item in failures
+    )
+    if (
+        state.get("version") != STATE_VERSION
+        or not receipts_valid
+        or not failures_valid
+    ):
+        raise ValueError(
+            f"Invalid or obsolete scanner state: {path}. "
+            "Move it aside before starting the hot-folder workflow."
+        )
+    return state
 
 
-def save_manifest(directory: Path, manifest: dict) -> None:
-    """Atomically persist the processing audit manifest."""
-    target = directory / MANIFEST_NAME
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f"{MANIFEST_NAME}.", dir=directory)
+def atomic_write(path: Path, content: str) -> None:
+    """Durably replace a UTF-8 text file without exposing partial content."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", dir=path.parent
+    )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(manifest, stream, indent=2, ensure_ascii=False)
-            stream.write("\n")
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_name, target)
+        os.replace(temporary_name, path)
     except Exception:
         Path(temporary_name).unlink(missing_ok=True)
         raise
 
 
-# ---------------------------------------------------------------------------
-# OCR
-# ---------------------------------------------------------------------------
+def save_state(directory: Path, state: dict) -> None:
+    """Atomically persist scanner state after each successful receipt."""
+    atomic_write(
+        directory / STATE_NAME,
+        json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+    )
 
 
-def query_ollama(model_id: str, image_b64: str) -> str:
-    """Submit the base64 image to the vision model and return the raw response.
-
-    Args:
-        model_id: Local ollama model to use.
-        image_b64: Base64-encoded JPEG image data.
-
-    Returns:
-        Stripped text response from the model.
-    """
-    return query_model(model_id, image_b64)
-
-
-# ---------------------------------------------------------------------------
-# File renaming
-# ---------------------------------------------------------------------------
+def collect_pending(
+    directory: Path, processed_hashes: set[str]
+) -> list[tuple[Path, str]]:
+    """Return sorted supported images whose content has not succeeded before."""
+    pending = []
+    seen_hashes = set(processed_hashes)
+    for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold()):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        digest = file_sha256(path)
+        if digest not in seen_hashes:
+            pending.append((path, digest))
+            seen_hashes.add(digest)
+    return pending
 
 
-def build_renamed_path(original: Path, price_cents: int) -> Path:
-    """Return the target path with the price suffix inserted before the extension.
-
-    Example::
-
-        Path("input/receipt.jpg"), 7949  →  Path("input/receipt_7949.jpg")
-
-    Args:
-        original: Original file path.
-        price_cents: Detected price in integer euro-cents.
-
-    Returns:
-        New ``Path`` in the same parent directory as *original*.
-    """
-    return original.parent / f"{original.stem}_{price_cents}{original.suffix}"
+def markdown_escape(value: str) -> str:
+    """Escape table delimiters in a Markdown cell."""
+    return value.replace("\\", "\\\\").replace("|", "\\|")
 
 
-def rename_without_overwrite(original: Path, target: Path) -> None:
-    """Rename a file without ever replacing an existing destination."""
-    os.link(original, target)
-    original.unlink()
+def render_report(state: dict, model_id: str) -> str:
+    """Render all successful receipts and the latest failures as Markdown."""
+    receipts = state["receipts"]
+    total = sum(item["price_cents"] for item in receipts)
+    lines = [
+        "# Receipt Report",
+        "",
+        f"Generated: `{utc_now()}`  ",
+        f"Local model: `{model_id}`  ",
+        f"Successfully processed receipts: **{len(receipts)}**",
+        "",
+        "| Receipt | Amount | Processed | SHA-256 |",
+        "|---|---:|---|---|",
+    ]
+    for item in receipts:
+        lines.append(
+            f"| {markdown_escape(item['file'])} | {format_price(item['price_cents'])} € "
+            f"| {item['processed_at']} | `{item['sha256'][:12]}` |"
+        )
+    if not receipts:
+        lines.append("| _No successful receipts yet_ | — | — | — |")
+    lines += ["", f"## Grand total: {format_price(total)} €"]
+    failures = state["last_failures"]
+    if failures:
+        lines += ["", "## Latest failed attempts", ""]
+        for item in failures:
+            lines.append(
+                f"- **{markdown_escape(item['file'])}:** {markdown_escape(item['error'])}"
+            )
+    lines += [
+        "",
+        "---",
+        "",
+        "Source images remain unchanged in the hot folder. A receipt is counted once by its SHA-256 content fingerprint.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
-# ---------------------------------------------------------------------------
-# Per-file processing
-# ---------------------------------------------------------------------------
+def write_report(path: Path, state: dict, model_id: str) -> None:
+    """Atomically publish the cumulative Markdown report."""
+    atomic_write(path, render_report(state, model_id))
 
 
-def process_file(path: Path, model_id: str) -> Optional[int]:
-    """OCR a single sales slip and rename it with its detected price.
-
-    On success the original file is renamed in-place and the price in
-    euro-cents is returned.  If no price is detected, or any error occurs,
-    the file is left untouched and ``None`` is returned.
-
-    Args:
-        path: Path to the image file.
-        model_id: Local ollama model to use for OCR.
-
-    Returns:
-        Detected price in euro-cents, or ``None``.
-    """
+def process_file(path: Path, digest: str, model_id: str, keep_alive: str) -> dict:
+    """Extract one receipt total while leaving the source image untouched."""
     print(f"  {path.name}", end=" … ", flush=True)
     try:
-        b64         = load_and_encode_image(path)
-        raw         = query_ollama(model_id, b64)
-        price_cents = parse_price(raw)
-
+        response = query_model(model_id, encode_image(path), keep_alive=keep_alive)
+        price_cents = parse_price(response)
         if price_cents is None:
-            print(f"SKIP  (response: {raw!r})")
-            return None
-
-        target = build_renamed_path(path, price_cents)
-        rename_without_overwrite(path, target)
-        euro = price_cents // 100
-        cent = price_cents % 100
-        print(f"OK  →  {target.name}  ({euro},{cent:02d} €)")
-        return price_cents
-
+            error = f"unparseable model response {response!r}"
+            print(f"FAIL ({error})")
+            return {"file": path.name, "sha256": digest, "error": error}
+        print(f"OK ({format_price(price_cents)} €)")
+        return {
+            "file": path.name,
+            "sha256": digest,
+            "price_cents": price_cents,
+            "model": model_id,
+            "response": response,
+            "processed_at": utc_now(),
+        }
     except Exception as exc:
-        print(f"ERROR  ({exc})")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
+        error = f"{type(exc).__name__}: {exc}"
+        print(f"ERROR ({error})")
+        return {"file": path.name, "sha256": digest, "error": error}
 
 
 def run(
     model_id: str = DEFAULT_MODEL,
-    input_dir: Path = INPUT_DIR,
+    input_dir: Path = HOT_FOLDER,
+    report_path: Path | None = None,
+    keep_alive: str = KEEP_ALIVE,
 ) -> dict:
-    """Scan *input_dir*, OCR each slip, rename files, and print a summary.
-
-    Args:
-        model_id: Local ollama model to use.  Must be installed.
-        input_dir: Directory containing the slip images to process.
-
-    Returns:
-        Summary dictionary::
-
-            {
-                "processed":   int,   # files successfully OCR-ed and renamed
-                "skipped":     int,   # files where no price was found
-                "total_cents": int,   # sum of all detected prices in cents
-                "results":     list,  # per-file dicts with "file" and "price_cents"
-            }
-
-    Raises:
-        SystemExit(1): If *model_id* is not installed in ollama.
-        FileNotFoundError: If *input_dir* does not exist.
-    """
+    """Process all new receipt content and publish a cumulative report."""
+    input_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_path or input_dir / REPORT_NAME
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_model_available(model_id)
+    state = load_state(input_dir)
+    processed_hashes = {item["sha256"] for item in state["receipts"]}
+    pending = collect_pending(input_dir, processed_hashes)
+    state["last_failures"] = []
 
-    manifest = load_manifest(input_dir)
-    processed_names = {entry["file"] for entry in manifest["receipts"]}
-    files = collect_input_files(input_dir, processed_names)
-    if not files:
-        print(f"No unprocessed image files found in: {input_dir}/")
-        return {"processed": 0, "skipped": 0, "total_cents": 0, "results": []}
+    if not pending:
+        save_state(input_dir, state)
+        write_report(report_path, state, model_id)
+        print(f"No new receipt images found in: {input_dir}")
+        print(f"Report: {report_path}")
+        return summary(state, [], report_path)
 
-    print(f"Found {len(files)} file(s)  [model: {model_id}]\n")
+    print(f"Found {len(pending)} new receipt(s) [model: {model_id}]")
+    print(f"Warming model and keeping it loaded for {keep_alive} …")
+    warm_model(model_id, keep_alive)
 
-    results: list[dict] = []
-    for f in files:
-        price = process_file(f, model_id)
-        results.append({"file": f.name, "price_cents": price})
-        if price is not None:
-            target = build_renamed_path(f, price)
-            manifest["receipts"].append({
-                "source": f.name,
-                "file": target.name,
-                "price_cents": price,
-                "model": model_id,
-            })
-            save_manifest(input_dir, manifest)
+    current_results = []
+    for path, digest in pending:
+        result = process_file(path, digest, model_id, keep_alive)
+        current_results.append(result)
+        if "price_cents" in result:
+            state["receipts"].append(result)
+            processed_hashes.add(digest)
+        else:
+            state["last_failures"].append(result)
+        save_state(input_dir, state)
+        write_report(report_path, state, model_id)
 
-    ok     = [r for r in results if r["price_cents"] is not None]
-    failed = [r for r in results if r["price_cents"] is None]
-    total  = sum(r["price_cents"] for r in ok)
+    result_summary = summary(state, current_results, report_path)
+    print("\n========== Receipt Summary ==========")
+    print(f"Processed this run : {result_summary['processed']}")
+    print(f"Failed this run    : {result_summary['failed']}")
+    print(f"All receipts      : {result_summary['receipt_count']}")
+    print(f"Grand total       : {format_price(result_summary['total_cents'])} €")
+    print(f"Report            : {report_path}")
+    print("=====================================")
+    return result_summary
 
-    print(f"\n{'─' * 50}")
-    print(f"  Processed : {len(ok)}")
-    print(f"  Skipped   : {len(failed)}")
-    print(f"  Total     : {total // 100},{total % 100:02d} €")
-    print(f"{'─' * 50}")
 
+def summary(state: dict, current_results: list[dict], report_path: Path) -> dict:
+    """Build the public run summary from durable state and current attempts."""
+    successful = [item for item in current_results if "price_cents" in item]
+    failed = [item for item in current_results if "error" in item]
     return {
-        "processed":   len(ok),
-        "skipped":     len(failed),
-        "total_cents": total,
-        "results":     results,
+        "processed": len(successful),
+        "failed": len(failed),
+        "receipt_count": len(state["receipts"]),
+        "total_cents": sum(item["price_cents"] for item in state["receipts"]),
+        "results": current_results,
+        "report": str(report_path),
     }
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    """Build and return parsed CLI arguments.
-
-    Args:
-        argv: Explicit argument list; defaults to ``sys.argv[1:]``.
-    """
-    parser = argparse.ArgumentParser(
-        description="OCR German grocery/gas sales slips with a local ollama vision model.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            f"Default model : {DEFAULT_MODEL}\n"
-            "Workflow      : drop images into input/ → run this script\n"
-            "Rename format : receipt.jpg → receipt_7949.jpg  (79,49 €)"
-        ),
-    )
-    parser.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        metavar="MODEL_NAME",
-        help=(
-            "ollama model to use for OCR (default: %(default)s). "
-            "Must be installed locally; see 'ollama list'."
-        ),
-    )
+    """Parse the hot-folder command-line interface."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--hot-folder", type=Path, default=HOT_FOLDER)
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--keep-alive", default=KEEP_ALIVE)
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Run the command-line workflow and return a process exit status."""
+    """Run the scanner and fail when any current receipt could not be read."""
     args = parse_args(argv)
-    summary = run(model_id=args.model)
-    return 1 if summary["skipped"] else 0
+    result = run(args.model, args.hot_folder, args.report, args.keep_alive)
+    return 1 if result["failed"] else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
