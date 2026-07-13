@@ -174,11 +174,12 @@ def pull(spec: ModelSpec, allow: bool, reserve: float) -> float:
     if free < required:
         raise RuntimeError(f"{free:.1f} GB free, {required:.1f} GB required")
     start = time.monotonic()
+    last_status = None
     for chunk in ollama.pull(spec.model, stream=True):
         status = getattr(chunk, "status", "")
-        if status:
-            print(f"\r  pull: {status[:80]:80}", end="", flush=True)
-    print()
+        if status and status != last_status:
+            print(f"  pull: {status[:80]}", flush=True)
+            last_status = status
     return time.monotonic() - start
 
 
@@ -319,14 +320,33 @@ def write_markdown(data: dict, specs: list[ModelSpec]) -> None:
             f"| {i} | {r['name']} | {r['correct']}/{r['total']} | {r['stable']}/3 | {warm} | {cold} | {r['size_gb']:.1f} GB | {r['errors']} |"
         )
     lines += ["", "## Storage actions", ""] + (
-        [f"- `{a['model']}` removed: {a['reason']}" for a in data["storage_actions"]]
+        [
+            f"- `{a['model']}` removed ({a['logical_size_bytes'] / 1024**3:.2f} GiB, digest `{a['digest'][:12]}`): {a['reason']}"
+            for a in data["storage_actions"]
+        ]
         or ["- None."]
     )
+    lines += [
+        "",
+        "## Compatibility findings",
+        "",
+        "- Granite 3.2 Vision exceeded the project's 4096-token context with these images.",
+        "- DeepSeek-OCR failed in Ollama with `unexpected EOF`; Llama 3.2 Vision failed to load its `mllama` architecture.",
+        "- Qwen3-VL returned no final content with thinking disabled; GLM-OCR returned full OCR text instead of one parseable amount.",
+        "",
+        "## Candidate sources",
+        "",
+    ]
+    lines += [f"- [{s.name}]({s.source}) — `{s.model}`" for s in specs]
     lines += [
         "",
         "## Method",
         "",
         f"Images were resized to at most {MAX_SIDE_PX}px, thinking was disabled, temperature was zero, and exact `Euro,Cent` responses were scored. Failed trials remain in the denominator.",
+        "",
+        "## Limitation",
+        "",
+        "This is a deterministic compatibility smoke test on three annotated German receipts, not a production accuracy estimate; a larger and more varied held-out set is required before deployment decisions.",
     ]
     RESULT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -576,6 +596,10 @@ def main(argv=None) -> int:
                     data["storage_actions"].append(
                         {
                             "model": spec.model,
+                            "digest": digest,
+                            "logical_size_bytes": data["models"][spec.model].get(
+                                "actual_size", 0
+                            ),
                             "at": now(),
                             "reason": f"accuracy {row['accuracy']:.0%} below {args.poor_threshold:.0%}",
                         }
