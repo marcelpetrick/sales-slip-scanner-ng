@@ -303,6 +303,17 @@ class TestQueryOllama:
             result = sss.query_ollama("some-model", "b64data")
         assert result == "79,49"
 
+    def test_uses_benchmarked_deterministic_options(self):
+        chat = fake_ollama_chat("79,49")
+        with patch("salesSlipScanner.ollama.chat", chat):
+            sss.query_ollama("some-model", "b64data")
+        assert chat.call_args.kwargs["think"] is False
+        assert chat.call_args.kwargs["options"] == {
+            "temperature": 0,
+            "num_ctx": 4096,
+            "num_predict": 64,
+        }
+
     def test_propagates_exception(self):
         with patch("salesSlipScanner.ollama.chat", side_effect=RuntimeError("timeout")):
             with pytest.raises(RuntimeError):
@@ -365,7 +376,7 @@ class TestProcessFile:
 
 
 class TestRun:
-    def _patch_model(self, model_id="qwen3-vl:4b"):
+    def _patch_model(self, model_id=sss.DEFAULT_MODEL):
         return patch(
             "salesSlipScanner.ollama.list",
             fake_ollama_list(model_id),
@@ -438,7 +449,9 @@ class TestRun:
 
     def test_missing_input_dir_raises(self):
         missing = Path("/tmp/does_not_exist_xyzzy")
-        with patch("salesSlipScanner.ollama.list", fake_ollama_list("qwen3-vl:4b")):
+        with patch(
+            "salesSlipScanner.ollama.list", fake_ollama_list(sss.DEFAULT_MODEL)
+        ):
             with pytest.raises(FileNotFoundError):
                 sss.run(input_dir=missing)
 

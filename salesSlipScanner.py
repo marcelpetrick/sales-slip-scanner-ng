@@ -49,7 +49,7 @@ from receipt_ocr import encode_image, model_id_is_available, parse_price, query_
 # ---------------------------------------------------------------------------
 
 #: Best accuracy/size balance from the local benchmark (100 %, 3.3 GB).
-DEFAULT_MODEL: str = "qwen3-vl:4b"
+DEFAULT_MODEL: str = "qwen3.5:4b"
 
 #: Directory where users drop files to be processed.
 INPUT_DIR: Path = Path(__file__).parent / "input"

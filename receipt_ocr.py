@@ -45,7 +45,8 @@ def query_model(model_id: str, image_b64: str) -> str:
             "content": PROMPT,
             "images": [image_b64],
         }],
-        options={"temperature": 0},
+        think=False,
+        options={"temperature": 0, "num_ctx": 4096, "num_predict": 64},
     )
     return response.message.content.strip()
 
