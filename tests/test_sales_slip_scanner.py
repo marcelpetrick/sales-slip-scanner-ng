@@ -267,10 +267,14 @@ class TestEnsureModelAvailable:
         with patch("salesSlipScanner.ollama.list", fake_ollama_list("qwen3-vl:4b")):
             sss.ensure_model_available("qwen3-vl:4b")  # must not raise
 
-    def test_prefix_match_passes(self):
-        # installed as "qwen3-vl:4b-fp16", queried as "qwen3-vl:4b"
+    def test_different_tag_is_rejected(self):
         with patch("salesSlipScanner.ollama.list", fake_ollama_list("qwen3-vl:4b-fp16")):
-            sss.ensure_model_available("qwen3-vl:4b")
+            with pytest.raises(SystemExit):
+                sss.ensure_model_available("qwen3-vl:4b")
+
+    def test_implicit_latest_tag_passes(self):
+        with patch("salesSlipScanner.ollama.list", fake_ollama_list("moondream:latest")):
+            sss.ensure_model_available("moondream")
 
     def test_absent_model_exits(self, capsys):
         with patch("salesSlipScanner.ollama.list", fake_ollama_list("moondream")):

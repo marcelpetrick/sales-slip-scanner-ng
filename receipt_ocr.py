@@ -66,3 +66,10 @@ def parse_price(raw_text: str) -> Optional[int]:
 def format_price(price_cents: int) -> str:
     """Format integer euro-cents as the model's canonical ``Euro,Cent`` form."""
     return f"{price_cents // 100},{price_cents % 100:02d}"
+
+
+def model_id_is_available(requested: str, available: list[str] | set[str]) -> bool:
+    """Return whether the exact requested model tag is locally available."""
+    if ":" in requested:
+        return requested in available
+    return requested in available or f"{requested}:latest" in available

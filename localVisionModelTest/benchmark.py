@@ -8,9 +8,9 @@ GPU target: NVIDIA RTX A2000 8 GB Laptop GPU.
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,7 +27,15 @@ from reportlab.platypus import (
     KeepTogether,
 )
 
-from receipt_ocr import MAX_SIDE_PX, PROMPT, encode_image, format_price, parse_price, query_model
+from receipt_ocr import (
+    MAX_SIDE_PX,
+    PROMPT,
+    encode_image,
+    format_price,
+    model_id_is_available,
+    parse_price,
+    query_model,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -36,6 +44,7 @@ from receipt_ocr import MAX_SIDE_PX, PROMPT, encode_image, format_price, parse_p
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_IMAGES_DIR = REPO_ROOT / "test_images"
 OUTPUT_PDF = Path(__file__).resolve().parent / "results.pdf"
+MIN_FREE_GB = 2.0
 
 # ---------------------------------------------------------------------------
 # Models available to benchmark. No models run unless selected on the CLI.
@@ -192,56 +201,47 @@ def installed_model_ids() -> set:
 
 
 def _is_installed(model_id: str) -> bool:
-    present = installed_model_ids()
-    base = model_id.split(":")[0]
-    tag  = model_id.split(":")[1] if ":" in model_id else ""
-    return any(
-        mid == model_id or (tag and mid.startswith(base + ":" + tag))
-        for mid in present
-    )
+    return model_id_is_available(model_id, installed_model_ids())
 
 
-def free_disk_gb() -> float:
-    st = os.statvfs("/")
-    return st.f_bavail * st.f_frsize / 1024 ** 3
+def model_storage_path() -> Path:
+    """Return the configured Ollama model-storage location."""
+    return Path(os.environ.get("OLLAMA_MODELS", Path.home() / ".ollama" / "models"))
 
 
-def pull_model(model_id: str, silent: bool = False) -> float:
+def free_disk_gb(path: Path) -> float:
+    """Return free space for the filesystem containing *path*."""
+    existing = path
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    return shutil.disk_usage(existing).free / 1024 ** 3
+
+
+def pull_model(spec: dict, allow_downloads: bool) -> float:
+    """Use an installed model or explicitly and capacity-safely download it."""
+    model_id = spec["id"]
     if _is_installed(model_id):
-        if not silent:
-            print(f"  [cache] {model_id} already installed")
+        print(f"  [cache] {model_id} already installed")
         return 0.0
-    free = free_disk_gb()
-    if free < 2.0:
-        raise RuntimeError(f"only {free:.1f} GB free — aborting pull to protect disk")
-    if not silent:
-        print(f"  [pull]  downloading {model_id} … ({free:.1f} GB free)", flush=True)
+    if not allow_downloads:
+        raise RuntimeError("model is not installed; use --allow-downloads to pull it")
+
+    storage = model_storage_path()
+    free = free_disk_gb(storage)
+    required = float(spec["size_gb"]) + MIN_FREE_GB
+    if free < required:
+        raise RuntimeError(
+            f"{free:.1f} GB free in {storage}; {required:.1f} GB required "
+            f"for the estimated model size plus {MIN_FREE_GB:.0f} GB reserve"
+        )
+    print(f"  [pull]  downloading {model_id} … ({free:.1f} GB free)", flush=True)
     t0 = time.monotonic()
     for chunk in ollama.pull(model_id, stream=True):
-        if not silent:
-            status = getattr(chunk, "status", "") or ""
-            if "pulling" in status or "success" in status:
-                print(f"\r         {status[:80]}    ", end="", flush=True)
-    if not silent:
-        print()
+        status = getattr(chunk, "status", "") or ""
+        if "pulling" in status or "success" in status:
+            print(f"\r         {status[:80]}    ", end="", flush=True)
+    print()
     return time.monotonic() - t0
-
-
-def remove_model(model_id: str) -> None:
-    try:
-        ollama.delete(model_id)
-        print(f"  [cleanup] removed {model_id} from disk")
-    except Exception as e:
-        print(f"  [cleanup] could not remove {model_id}: {e}")
-
-
-def prefetch_model(model_id: str) -> Optional[threading.Thread]:
-    if _is_installed(model_id):
-        return None
-    print(f"  [prefetch] background download of {model_id} …", flush=True)
-    t = threading.Thread(target=pull_model, args=(model_id, True), daemon=True)
-    t.start()
-    return t
 
 
 def extract_expected(filename: str) -> str:
@@ -268,26 +268,18 @@ def run_model_on_image(model_id: str, image_path: Path) -> tuple[str, float]:
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
-def benchmark(model_specs: list[dict]) -> list[ModelResult]:
+def benchmark(model_specs: list[dict], allow_downloads: bool = False) -> list[ModelResult]:
     test_images = sorted(TEST_IMAGES_DIR.glob("*.jpg"))
     if not test_images:
         sys.exit(f"No JPEG images found in {TEST_IMAGES_DIR}")
 
     results: list[ModelResult] = []
-    prefetch_thread: Optional[threading.Thread] = None
-
-    for i, spec in enumerate(model_specs):
+    for spec in model_specs:
         mid = spec["id"]
         print(f"\n{'='*60}\nModel: {spec['display']} ({mid})\n{'='*60}")
 
-        if prefetch_thread is not None:
-            if prefetch_thread.is_alive():
-                print("  [prefetch] waiting for download …", flush=True)
-                prefetch_thread.join()
-            prefetch_thread = None
-
         try:
-            pull_time = pull_model(mid)
+            pull_time = pull_model(spec, allow_downloads)
         except Exception as e:
             print(f"  [skip] {e}")
             results.append(ModelResult(mid, spec["display"], spec["size"], 0.0,
@@ -295,11 +287,6 @@ def benchmark(model_specs: list[dict]) -> list[ModelResult]:
             continue
 
         mr = ModelResult(mid, spec["display"], spec["size"], pull_time)
-
-        # Prefetch next keep=True model while running inference
-        next_spec = model_specs[i + 1] if i + 1 < len(model_specs) else None
-        if next_spec and next_spec.get("keep", True):
-            prefetch_thread = prefetch_model(next_spec["id"])
 
         for img_path in test_images:
             expected = extract_expected(img_path.name)
@@ -325,14 +312,6 @@ def benchmark(model_specs: list[dict]) -> list[ModelResult]:
                         options={"num_predict": 1, "keep_alive": "0"})
         except Exception:
             pass
-
-        # Emergency eviction from disk only
-        if free_disk_gb() < 2.0 and not spec.get("keep", True):
-            print(f"  [disk] emergency eviction of {mid}")
-            remove_model(mid)
-
-    if prefetch_thread and prefetch_thread.is_alive():
-        prefetch_thread.join()
 
     return results
 
@@ -539,6 +518,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="run every configured model",
     )
+    parser.add_argument(
+        "--allow-downloads",
+        action="store_true",
+        help="allow selected missing models to be downloaded after a capacity check",
+    )
     args = parser.parse_args(argv)
     if args.all and args.model:
         parser.error("--all and --model cannot be combined")
@@ -571,7 +555,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Test images: {TEST_IMAGES_DIR}")
     print(f"Models to run: {len(model_specs)}  (+{len(ARCHIVED_RESULTS)} archived)")
 
-    live = benchmark(model_specs)
+    live = benchmark(model_specs, allow_downloads=args.allow_downloads)
 
     print("\n=== Building PDF report ===")
     build_pdf(live, gpu_info())

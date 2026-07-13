@@ -42,7 +42,7 @@ from typing import Optional
 
 import ollama
 
-from receipt_ocr import encode_image, parse_price, query_model
+from receipt_ocr import encode_image, model_id_is_available, parse_price, query_model
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -80,9 +80,6 @@ def list_local_models() -> list[str]:
 def ensure_model_available(model_id: str) -> None:
     """Assert that *model_id* is installed locally; exit with an error if not.
 
-    Performs a prefix match so ``"qwen3-vl:4b"`` matches entries like
-    ``"qwen3-vl:4b-fp16"``.
-
     Args:
         model_id: The ollama model identifier to verify.
 
@@ -91,13 +88,7 @@ def ensure_model_available(model_id: str) -> None:
         RuntimeError: When the ollama server is unreachable.
     """
     available = list_local_models()
-    base = model_id.split(":")[0]
-    tag  = model_id.split(":")[1] if ":" in model_id else ""
-    found = any(
-        m == model_id or (tag and m.startswith(f"{base}:{tag}"))
-        for m in available
-    )
-    if not found:
+    if not model_id_is_available(model_id, available):
         print(f"Error: model '{model_id}' is not installed in ollama.", file=sys.stderr)
         print(
             f"  Available: {', '.join(available) if available else '(none)'}",
