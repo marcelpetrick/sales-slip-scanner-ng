@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Vision model benchmark on the local ollama server.
-Tests each model on German grocery sales slip images and measures accuracy + latency.
+Runs a receipt-OCR smoke test and measures exact-match rate plus latency.
 GPU target: NVIDIA RTX A2000 8 GB Laptop GPU.
 """
 
+import argparse
 import os
 import re
 import subprocess
@@ -37,15 +38,34 @@ TEST_IMAGES_DIR = REPO_ROOT / "test_images"
 OUTPUT_PDF = Path(__file__).resolve().parent / "results.pdf"
 
 # ---------------------------------------------------------------------------
-# Models to benchmark
-# keep=True  → always retain on disk
-# keep=False → retain unless free disk < 2 GB (emergency eviction only)
+# Models available to benchmark. No models run unless selected on the CLI.
 # ---------------------------------------------------------------------------
 
-# All known candidates have been benchmarked. Add new model IDs here for
-# future benchmark runs; they will be downloaded, tested, and kept on disk
-# unless the 2 GB emergency eviction threshold is hit.
-MODELS: list[dict] = []
+MODELS: list[dict] = [
+    {"id": "moondream", "display": "Moondream 2", "size": "~1.7 GB", "size_gb": 1.7},
+    {"id": "llava-phi3", "display": "LLaVA-Phi3", "size": "~2.9 GB", "size_gb": 2.9},
+    {"id": "gemma3:4b", "display": "Gemma 3 4B", "size": "~3.3 GB", "size_gb": 3.3},
+    {"id": "llava:7b", "display": "LLaVA 1.5 7B", "size": "~4.7 GB", "size_gb": 4.7},
+    {"id": "Keyvan/german-ocr-3", "display": "German-OCR-3", "size": "~2.7 GB", "size_gb": 2.7},
+    {
+        "id": "richardyoung/smolvlm2-2.2b-instruct",
+        "display": "SmolVLM2 2.2B",
+        "size": "~1.1 GB",
+        "size_gb": 1.1,
+    },
+    {"id": "minicpm-o:4b", "display": "MiniCPM-o 4B", "size": "~5.0 GB", "size_gb": 5.0},
+    {"id": "qwen3-vl:4b", "display": "Qwen3-VL 4B", "size": "~3.3 GB", "size_gb": 3.3},
+    {"id": "qwen2.5-vl:7b", "display": "Qwen2.5-VL 7B", "size": "~5.5 GB", "size_gb": 5.5},
+    {"id": "qwen2-vl:7b", "display": "Qwen2-VL 7B", "size": "~5.5 GB", "size_gb": 5.5},
+    {"id": "minicpm-v", "display": "MiniCPM-V 2.6", "size": "~5.5 GB", "size_gb": 5.5},
+    {"id": "bakllava", "display": "BakLLaVA 7B", "size": "~4.7 GB", "size_gb": 4.7},
+    {
+        "id": "llama3.2-vision:11b",
+        "display": "Llama 3.2-Vision 11B",
+        "size": "~7.9 GB",
+        "size_gb": 7.9,
+    },
+]
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -74,14 +94,13 @@ class ModelResult:
 
     @property
     def accuracy(self) -> float:
-        valid = [r for r in self.image_results if r.error is None]
-        if not valid:
+        if not self.image_results:
             return 0.0
-        return sum(r.correct for r in valid) / len(valid)
+        return self.correct_count / len(self.image_results)
 
     @property
     def correct_count(self) -> int:
-        return sum(r.correct for r in self.image_results if r.error is None)
+        return sum(r.correct for r in self.image_results)
 
     @property
     def avg_latency_s(self) -> float:
@@ -226,7 +245,7 @@ def prefetch_model(model_id: str) -> Optional[threading.Thread]:
 
 
 def extract_expected(filename: str) -> str:
-    m = re.search(r"_(\d+)\.", filename)
+    m = re.search(r"_(\d+)\.[^.]+$", filename)
     if not m:
         return "?"
     cents = int(m.group(1))
@@ -249,7 +268,7 @@ def run_model_on_image(model_id: str, image_path: Path) -> tuple[str, float]:
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
-def benchmark() -> list[ModelResult]:
+def benchmark(model_specs: list[dict]) -> list[ModelResult]:
     test_images = sorted(TEST_IMAGES_DIR.glob("*.jpg"))
     if not test_images:
         sys.exit(f"No JPEG images found in {TEST_IMAGES_DIR}")
@@ -257,7 +276,7 @@ def benchmark() -> list[ModelResult]:
     results: list[ModelResult] = []
     prefetch_thread: Optional[threading.Thread] = None
 
-    for i, spec in enumerate(MODELS):
+    for i, spec in enumerate(model_specs):
         mid = spec["id"]
         print(f"\n{'='*60}\nModel: {spec['display']} ({mid})\n{'='*60}")
 
@@ -278,7 +297,7 @@ def benchmark() -> list[ModelResult]:
         mr = ModelResult(mid, spec["display"], spec["size"], pull_time)
 
         # Prefetch next keep=True model while running inference
-        next_spec = MODELS[i + 1] if i + 1 < len(MODELS) else None
+        next_spec = model_specs[i + 1] if i + 1 < len(model_specs) else None
         if next_spec and next_spec.get("keep", True):
             prefetch_thread = prefetch_model(next_spec["id"])
 
@@ -334,8 +353,11 @@ def acc_color(pct: float) -> colors.Color:
 
 
 def build_pdf(live_results: list[ModelResult], gpu_info: str):
-    # Merge live + archived, sort by accuracy desc then latency asc
-    all_results = live_results + ARCHIVED_RESULTS
+    # A live result supersedes an archived result for the same model.
+    live_ids = {result.model_id for result in live_results}
+    all_results = live_results + [
+        result for result in ARCHIVED_RESULTS if result.model_id not in live_ids
+    ]
     ranked = sorted(
         [r for r in all_results if not r.skipped],
         key=lambda r: (-r.accuracy, r.avg_latency_s if r.avg_latency_s == r.avg_latency_s else 9999)
@@ -375,9 +397,10 @@ def build_pdf(live_results: list[ModelResult], gpu_info: str):
         "<b>Task:</b> Extract the total amount from German grocery / gas sales slips. "
         "Each model receives the raw JPEG (resized ≤ 1500 px longest side) and a fixed "
         "prompt asking for the sum in <i>Euro,Cent</i> format. "
-        "<b>Accuracy</b> = share of 3 annotated test images where the extracted value "
+        "<b>Smoke-test exact-match rate</b> = share of 3 annotated test images where the extracted value "
         "matches the ground truth encoded in the filename "
         "(<i>slip0_7949.jpg</i> → 79,49 €). "
+        "This tiny convenience sample is not an estimate of production accuracy. "
         "Models marked <i>archived</i> were tested in an earlier run and removed from "
         "disk afterwards.",
         body_s
@@ -502,6 +525,33 @@ def build_pdf(live_results: list[ModelResult], gpu_info: str):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Parse explicit model selections for a benchmark run."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        action="append",
+        choices=[spec["id"] for spec in MODELS],
+        help="model to run; repeat to select more than one",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="run every configured model",
+    )
+    args = parser.parse_args(argv)
+    if args.all and args.model:
+        parser.error("--all and --model cannot be combined")
+    return args
+
+
+def selected_models(args: argparse.Namespace) -> list[dict]:
+    """Resolve command-line selections to model specifications."""
+    if args.all:
+        return MODELS
+    selected_ids = set(args.model or [])
+    return [spec for spec in MODELS if spec["id"] in selected_ids]
+
 def gpu_info() -> str:
     try:
         return subprocess.check_output(
@@ -512,13 +562,16 @@ def gpu_info() -> str:
         return "GPU info unavailable"
 
 
-if __name__ == "__main__":
+def main(argv: Optional[list[str]] = None) -> int:
+    """Run selected models and rebuild the archived/live smoke-test report."""
+    args = parse_args(argv)
+    model_specs = selected_models(args)
     print("=== Local Vision Model Benchmark ===")
     print(f"GPU: {gpu_info()}")
     print(f"Test images: {TEST_IMAGES_DIR}")
-    print(f"Models to run: {len(MODELS)}  (+{len(ARCHIVED_RESULTS)} archived)")
+    print(f"Models to run: {len(model_specs)}  (+{len(ARCHIVED_RESULTS)} archived)")
 
-    live = benchmark()
+    live = benchmark(model_specs)
 
     print("\n=== Building PDF report ===")
     build_pdf(live, gpu_info())
@@ -535,3 +588,8 @@ if __name__ == "__main__":
         print(f"{i:<3} {mr.display_name:<28} {mr.accuracy*100:>5.0f}%  {lat:>9}  {flag}")
     for mr in [r for r in all_res if r.skipped]:
         print(f"{'—':<3} {mr.display_name:<28}  skip   —          skipped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
