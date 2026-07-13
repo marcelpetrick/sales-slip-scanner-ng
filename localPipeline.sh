@@ -7,11 +7,14 @@ set -o pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${ROOT_DIR}/.venv"
 PYTHON="${VENV_DIR}/bin/python"
+SYSTEM_PYTHON="${SYSTEM_PYTHON:-python3}"
+REQUIRED_PYTHON="3.14.6"
 PIPELINE_LOG_DIR="${TMPDIR:-/tmp}/sales-slip-scanner-pipeline-$$"
 
 declare -a SUMMARY_LINES=()
 
 VENV_OK=0
+PYTHON_OK=0
 INSTALL_OK=0
 LINT_OK=0
 TESTS_OK=0
@@ -77,11 +80,16 @@ print_summary() {
 
 prepare_virtual_environment() {
     if [[ -x "${PYTHON}" ]]; then
+        if [[ "$("${PYTHON}" -c 'import platform; print(platform.python_version())')" != \
+              "${REQUIRED_PYTHON}" ]]; then
+            error "Existing .venv does not use Python ${REQUIRED_PYTHON}. Remove it and rerun."
+            return 1
+        fi
         log "Using existing virtual environment: ${VENV_DIR}"
         return 0
     fi
     log "Creating virtual environment: ${VENV_DIR}"
-    python3 -m venv "${VENV_DIR}"
+    "${SYSTEM_PYTHON}" -m venv "${VENV_DIR}"
 }
 
 main() {
@@ -92,11 +100,19 @@ main() {
     mkdir -p "${PIPELINE_LOG_DIR}"
     trap 'rm -rf "${PIPELINE_LOG_DIR}"' EXIT
 
-    if prepare_virtual_environment; then
+    if [[ "$("${SYSTEM_PYTHON}" -c 'import platform; print(platform.python_version())' 2>/dev/null)" == \
+          "${REQUIRED_PYTHON}" ]]; then
+        PYTHON_OK=1
+        mark_result "Python" "PASS" "${REQUIRED_PYTHON}"
+    else
+        mark_result "Python" "FAIL" "Python ${REQUIRED_PYTHON} is required"
+    fi
+
+    if [[ "${PYTHON_OK}" -eq 1 ]] && prepare_virtual_environment; then
         VENV_OK=1
         mark_result "Virtualenv" "PASS" ".venv is available"
     else
-        mark_result "Virtualenv" "FAIL" "Could not create or reuse .venv"
+        mark_result "Virtualenv" "FAIL" "Could not create or reuse a Python ${REQUIRED_PYTHON} .venv"
     fi
 
     if [[ "${VENV_OK}" -eq 1 ]]; then
@@ -145,7 +161,7 @@ main() {
         mark_result "Tests+Coverage" "SKIP" "Dependencies are unavailable"
     fi
 
-    if [[ "${VENV_OK}" -eq 1 && "${INSTALL_OK}" -eq 1 && \
+    if [[ "${PYTHON_OK}" -eq 1 && "${VENV_OK}" -eq 1 && "${INSTALL_OK}" -eq 1 && \
           "${LINT_OK}" -eq 1 && "${TESTS_OK}" -eq 1 ]]; then
         exit_code=0
         log "localPipeline.sh completed successfully"

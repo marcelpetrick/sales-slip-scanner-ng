@@ -1,0 +1,22 @@
+[project]
+name = "sales-slip-scanner-ng"
+version = "0.1.0"
+requires-python = "==3.14.*"
+dependencies = [
+    "Pillow==12.3.0",
+    "ollama==0.6.2",
+    "reportlab==5.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "ruff==0.15.20",
+]
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.setuptools]
+py-modules = ["receipt_ocr", "salesSlipScanner"]

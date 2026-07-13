@@ -2,3 +2,5 @@ coverage_html/
 __pycache__/
 .coverage
 .venv/
+build/
+*.egg-info/
