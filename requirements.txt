@@ -1,6 +1,7 @@
 # Runtime
 Pillow>=10.0
 ollama>=0.6.0
+reportlab>=4.0
 
 # Development / testing
 pytest>=8.0

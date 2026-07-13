@@ -1,76 +1,159 @@
 #!/usr/bin/env bash
-# localPipeline.sh — run all quality gates before committing
-#
-# Stages:
-#   1. Dependency check
-#   2. Lint  (ruff)
-#   3. Unit tests with coverage
-#   4. Coverage threshold enforcement (80 %)
-#
-# Exit code: 0 = all green, non-zero = at least one stage failed.
-# Run from the repository root: ./localPipeline.sh
+# Run the repository's local quality gates and always print a final summary.
 
-set -euo pipefail
+set -u
+set -o pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$REPO_ROOT"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="${ROOT_DIR}/.venv"
+PYTHON="${VENV_DIR}/bin/python"
+PIPELINE_LOG_DIR="${TMPDIR:-/tmp}/sales-slip-scanner-pipeline-$$"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BOLD='\033[1m'
-RESET='\033[0m'
+declare -a SUMMARY_LINES=()
 
-pass() { echo -e "${GREEN}✔ $*${RESET}"; }
-fail() { echo -e "${RED}✖ $*${RESET}"; }
-info() { echo -e "${YELLOW}▶ $*${RESET}"; }
-sep()  { echo -e "${BOLD}────────────────────────────────────────${RESET}"; }
+VENV_OK=0
+INSTALL_OK=0
+LINT_OK=0
+TESTS_OK=0
 
-FAILURES=0
+log() {
+    printf '[INFO] %s\n' "$*"
+}
 
-run_stage() {
-    local label="$1"; shift
-    sep
-    info "Stage: ${label}"
-    if "$@"; then
-        pass "${label} passed"
+error() {
+    printf '[ERROR] %s\n' "$*" >&2
+}
+
+mark_result() {
+    local label="$1"
+    local status="$2"
+    local details="$3"
+    SUMMARY_LINES+=("$(printf '%-16s : %-4s %s' "${label}" "${status}" "${details}")")
+}
+
+run_with_log() {
+    local log_path="$1"
+    shift
+    "$@" 2>&1 | tee "${log_path}"
+    return "${PIPESTATUS[0]}"
+}
+
+extract_ruff_details() {
+    local log_path="$1"
+    local found_line
+
+    if grep -q "All checks passed" "${log_path}"; then
+        printf '%s\n' "0 violations"
+        return
+    fi
+    found_line="$(grep -E "Found [0-9]+ error" "${log_path}" | tail -n 1 || true)"
+    printf '%s\n' "${found_line:-see Ruff output}"
+}
+
+extract_test_details() {
+    local log_path="$1"
+    local result_line
+    local coverage
+
+    result_line="$(grep -E '[0-9]+ (passed|failed)' "${log_path}" | tail -n 1 || true)"
+    coverage="$(awk '$1 == "TOTAL" { print $NF }' "${log_path}" | tail -n 1)"
+    if [[ -n "${result_line}" && -n "${coverage}" ]]; then
+        printf '%s; %s coverage\n' "${result_line}" "${coverage}"
+    elif [[ -n "${result_line}" ]]; then
+        printf '%s\n' "${result_line}"
     else
-        fail "${label} FAILED"
-        FAILURES=$(( FAILURES + 1 ))
+        printf '%s\n' "see pytest output"
     fi
 }
 
-# ── 1. Dependencies ──────────────────────────────────────────────────────────
-run_stage "Dependency install" \
-    pip install --quiet --break-system-packages -r requirements.txt
+print_summary() {
+    printf '\n========== Local Pipeline Summary ==========\n'
+    local line
+    for line in "${SUMMARY_LINES[@]}"; do
+        printf '%s\n' "${line}"
+    done
+    printf '============================================\n'
+}
 
-# ── 2. Lint ──────────────────────────────────────────────────────────────────
-run_stage "Lint (ruff)" \
-    ruff check salesSlipScanner.py tests/
+prepare_virtual_environment() {
+    if [[ -x "${PYTHON}" ]]; then
+        log "Using existing virtual environment: ${VENV_DIR}"
+        return 0
+    fi
+    log "Creating virtual environment: ${VENV_DIR}"
+    python3 -m venv "${VENV_DIR}"
+}
 
-# ── 3. Unit tests + coverage ─────────────────────────────────────────────────
-sep
-info "Stage: Unit tests + coverage"
-if python -m pytest tests/ \
-        --tb=short \
-        -q \
-        --cov=salesSlipScanner \
-        --cov-report=term-missing \
-        --cov-report=html:coverage_html \
-        --cov-fail-under=80; then
-    pass "Tests + coverage passed"
-else
-    fail "Tests + coverage FAILED"
-    FAILURES=$(( FAILURES + 1 ))
-fi
+main() {
+    local ruff_details=""
+    local test_details=""
+    local exit_code=1
 
-# ── Summary ──────────────────────────────────────────────────────────────────
-sep
-if [ "$FAILURES" -eq 0 ]; then
-    echo -e "${GREEN}${BOLD}All pipeline stages passed.${RESET}"
-    echo -e "  Coverage report: ${REPO_ROOT}/coverage_html/index.html"
-    exit 0
-else
-    echo -e "${RED}${BOLD}${FAILURES} stage(s) failed — fix before committing.${RESET}"
-    exit 1
-fi
+    mkdir -p "${PIPELINE_LOG_DIR}"
+    trap 'rm -rf "${PIPELINE_LOG_DIR}"' EXIT
+
+    if prepare_virtual_environment; then
+        VENV_OK=1
+        mark_result "Virtualenv" "PASS" ".venv is available"
+    else
+        mark_result "Virtualenv" "FAIL" "Could not create or reuse .venv"
+    fi
+
+    if [[ "${VENV_OK}" -eq 1 ]]; then
+        log "Installing runtime and development dependencies."
+        if run_with_log "${PIPELINE_LOG_DIR}/dependencies.log" \
+            "${PYTHON}" -m pip install --quiet -r "${ROOT_DIR}/requirements.txt"; then
+            INSTALL_OK=1
+            mark_result "Dependencies" "PASS" "requirements.txt installed"
+        else
+            mark_result "Dependencies" "FAIL" "Dependency installation failed"
+        fi
+    else
+        mark_result "Dependencies" "SKIP" "Virtualenv is unavailable"
+    fi
+
+    if [[ "${INSTALL_OK}" -eq 1 ]]; then
+        log "Running Ruff across all repository Python code."
+        if run_with_log "${PIPELINE_LOG_DIR}/ruff.log" "${PYTHON}" -m ruff check "${ROOT_DIR}"; then
+            LINT_OK=1
+            ruff_details="$(extract_ruff_details "${PIPELINE_LOG_DIR}/ruff.log")"
+            mark_result "Ruff" "PASS" "${ruff_details}"
+        else
+            ruff_details="$(extract_ruff_details "${PIPELINE_LOG_DIR}/ruff.log")"
+            mark_result "Ruff" "FAIL" "${ruff_details}"
+        fi
+
+        log "Running pytest with coverage."
+        if run_with_log "${PIPELINE_LOG_DIR}/pytest.log" \
+            "${PYTHON}" -m pytest "${ROOT_DIR}/tests" \
+            --tb=short \
+            -q \
+            --cov=salesSlipScanner \
+            --cov-report=term-missing \
+            --cov-report="html:${ROOT_DIR}/coverage_html" \
+            --cov-fail-under=80; then
+            TESTS_OK=1
+            test_details="$(extract_test_details "${PIPELINE_LOG_DIR}/pytest.log")"
+            mark_result "Tests+Coverage" "PASS" "${test_details}"
+        else
+            test_details="$(extract_test_details "${PIPELINE_LOG_DIR}/pytest.log")"
+            mark_result "Tests+Coverage" "FAIL" "${test_details}"
+        fi
+    else
+        mark_result "Ruff" "SKIP" "Dependencies are unavailable"
+        mark_result "Tests+Coverage" "SKIP" "Dependencies are unavailable"
+    fi
+
+    if [[ "${VENV_OK}" -eq 1 && "${INSTALL_OK}" -eq 1 && \
+          "${LINT_OK}" -eq 1 && "${TESTS_OK}" -eq 1 ]]; then
+        exit_code=0
+        log "localPipeline.sh completed successfully"
+    else
+        error "localPipeline.sh completed with failing mandatory stage(s)"
+    fi
+
+    print_summary
+    exit "${exit_code}"
+}
+
+main "$@"

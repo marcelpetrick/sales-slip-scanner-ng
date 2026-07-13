@@ -21,7 +21,6 @@ from typing import Optional
 import ollama
 from PIL import Image
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
@@ -353,10 +352,13 @@ def benchmark() -> list[ModelResult]:
 
 # Accuracy colour bands
 def acc_color(pct: float) -> colors.Color:
-    if pct >= 1.0:   return colors.HexColor("#1e8449")   # green
-    if pct >= 0.67:  return colors.HexColor("#d4ac0d")   # gold
-    if pct >= 0.33:  return colors.HexColor("#e67e22")   # orange
-    return           colors.HexColor("#c0392b")           # red
+    if pct >= 1.0:
+        return colors.HexColor("#1e8449")  # green
+    if pct >= 0.67:
+        return colors.HexColor("#d4ac0d")  # gold
+    if pct >= 0.33:
+        return colors.HexColor("#e67e22")  # orange
+    return colors.HexColor("#c0392b")  # red
 
 
 def build_pdf(live_results: list[ModelResult], gpu_info: str):
@@ -383,9 +385,6 @@ def build_pdf(live_results: list[ModelResult], gpu_info: str):
     sub_s    = style("S",  fontSize=8,  textColor=colors.HexColor("#555555"), spaceAfter=6)
     h2_s     = style("H2", fontSize=10, fontName="Helvetica-Bold", spaceBefore=10, spaceAfter=4)
     body_s   = style("B",  fontSize=8,  leading=11)
-    small_s  = style("Sm", fontSize=6.5, leading=9, textColor=colors.HexColor("#444444"))
-    right_s  = style("R",  fontSize=7,  alignment=TA_RIGHT)
-    center_s = style("C",  fontSize=7,  alignment=TA_CENTER)
     note_s   = style("N",  fontSize=6,  textColor=colors.grey, leading=8)
 
     story = []
