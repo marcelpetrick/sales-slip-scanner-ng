@@ -1,6 +1,5 @@
-"""Offline unit tests for benchmark scoring and selection."""
+"""Offline tests for the resumable benchmark."""
 
-from argparse import Namespace
 from unittest.mock import patch
 
 import pytest
@@ -8,52 +7,74 @@ import pytest
 from localVisionModelTest import benchmark as bm
 
 
-def test_inference_errors_count_as_incorrect():
-    result = bm.ModelResult(
-        "model",
-        "Model",
-        "1 GB",
-        0,
-        image_results=[
-            bm.ImageResult("a_100.jpg", "1,00", "1,00", True, 1.0),
-            bm.ImageResult("b_200.jpg", "2,00", "", False, 0.0, "timeout"),
-        ],
-    )
-    assert result.accuracy == 0.5
-    assert result.correct_count == 1
+def result(trials):
+    return {"trials": trials}
 
 
-def test_expected_amount_comes_from_final_filename_suffix():
-    assert bm.extract_expected("shop_2024_receipt_1093.jpg") == "10,93"
-    assert bm.extract_expected("receipt.jpg") == "?"
+def trial(image="a.jpg", correct=True, latency=1.0, error=None):
+    return {"image": image, "correct": correct, "wall_seconds": latency, "error": error}
 
 
-def test_model_catalog_is_available_for_repeatable_selection():
-    assert len(bm.MODELS) == 13
-    assert bm.selected_models(Namespace(all=False, model=["qwen3-vl:4b"])) == [
-        next(spec for spec in bm.MODELS if spec["id"] == "qwen3-vl:4b")
+def test_errors_remain_in_accuracy_denominator():
+    spec = bm.MODELS[0]
+    row = bm.summary(spec, result([trial(), trial(correct=False, error="timeout")]))
+    assert row["accuracy"] == 0.5
+    assert row["errors"] == 1
+
+
+def test_stable_receipt_requires_every_run_correct():
+    spec = bm.MODELS[0]
+    row = bm.summary(spec, result([trial(), trial(), trial(correct=False)]))
+    assert row["stable"] == 0
+
+
+def test_recommend_smallest_model_within_speed_margin():
+    rows = [
+        {
+            "model": "fast",
+            "name": "Fast",
+            "total": 9,
+            "accuracy": 1,
+            "stable": 3,
+            "warm": 1.0,
+            "size_gb": 4,
+        },
+        {
+            "model": "small",
+            "name": "Small",
+            "total": 9,
+            "accuracy": 1,
+            "stable": 3,
+            "warm": 1.4,
+            "size_gb": 2,
+        },
     ]
+    assert bm.recommend(rows)["model"] == "small"
 
 
-def test_all_and_individual_selection_are_mutually_exclusive():
-    with pytest.raises(SystemExit):
-        bm.parse_args(["--all", "--model", "moondream"])
-
-
-def test_missing_model_is_not_downloaded_without_opt_in():
-    spec = next(spec for spec in bm.MODELS if spec["id"] == "qwen3-vl:4b")
-    with patch.object(bm, "_is_installed", return_value=False), \
-         patch.object(bm.ollama, "pull") as pull:
+def test_missing_model_never_downloads_without_permission():
+    with (
+        patch.object(bm, "installed", return_value={}),
+        patch.object(bm.ollama, "pull") as pull,
+    ):
         with pytest.raises(RuntimeError, match="allow-downloads"):
-            bm.pull_model(spec, allow_downloads=False)
+            bm.pull(bm.MODELS[0], False, 10)
     pull.assert_not_called()
 
 
-def test_download_requires_model_size_plus_reserve():
-    spec = next(spec for spec in bm.MODELS if spec["id"] == "qwen3-vl:4b")
-    with patch.object(bm, "_is_installed", return_value=False), \
-         patch.object(bm, "free_disk_gb", return_value=5.0), \
-         patch.object(bm.ollama, "pull") as pull:
+def test_capacity_check_uses_size_plus_reserve():
+    with (
+        patch.object(bm, "installed", return_value={}),
+        patch.object(bm, "free_gb", return_value=11),
+    ):
         with pytest.raises(RuntimeError, match="required"):
-            bm.pull_model(spec, allow_downloads=True)
-    pull.assert_not_called()
+            bm.pull(bm.MODELS[0], True, 10)
+
+
+def test_cli_requires_explicit_selection():
+    with pytest.raises(SystemExit):
+        bm.parse_args([])
+
+
+def test_catalog_contains_fifteen_local_models():
+    assert len(bm.MODELS) == 15

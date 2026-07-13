@@ -1,580 +1,600 @@
 #!/usr/bin/env python3
-"""
-Vision model benchmark on the local ollama server.
-Runs a receipt-OCR smoke test and measures exact-match rate plus latency.
-GPU target: NVIDIA RTX A2000 8 GB Laptop GPU.
-"""
+"""Resumable local receipt-OCR benchmark for compact Ollama vision models."""
+
+from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import shutil
+import signal
+import statistics
 import subprocess
-import sys
+import tempfile
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import ollama
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
-from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable,
-    KeepTogether,
-)
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.pdfgen import canvas
 
-from receipt_ocr import (
-    MAX_SIDE_PX,
-    PROMPT,
-    encode_image,
-    format_price,
-    model_id_is_available,
-    parse_price,
-    query_model,
-)
+from receipt_ocr import MAX_SIDE_PX, PROMPT, encode_image, parse_price
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent.parent
+IMAGES = ROOT / "test_images"
+RESULT_JSON = Path(__file__).with_name("results.json")
+RESULT_MD = Path(__file__).with_name("results.md")
+RESULT_PDF = Path(__file__).with_name("results.pdf")
+SCHEMA = 3
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-TEST_IMAGES_DIR = REPO_ROOT / "test_images"
-OUTPUT_PDF = Path(__file__).resolve().parent / "results.pdf"
-MIN_FREE_GB = 2.0
-ARCHIVED_RUN = "2026-06-08 · NVIDIA RTX A2000 8 GB Laptop GPU"
 
-# ---------------------------------------------------------------------------
-# Models available to benchmark. No models run unless selected on the CLI.
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ModelSpec:
+    model: str
+    name: str
+    size_gb: float
+    source: str
 
-MODELS: list[dict] = [
-    {"id": "moondream", "display": "Moondream 2", "size": "~1.7 GB", "size_gb": 1.7},
-    {"id": "llava-phi3", "display": "LLaVA-Phi3", "size": "~2.9 GB", "size_gb": 2.9},
-    {"id": "gemma3:4b", "display": "Gemma 3 4B", "size": "~3.3 GB", "size_gb": 3.3},
-    {"id": "llava:7b", "display": "LLaVA 1.5 7B", "size": "~4.7 GB", "size_gb": 4.7},
-    {"id": "Keyvan/german-ocr-3", "display": "German-OCR-3", "size": "~2.7 GB", "size_gb": 2.7},
-    {
-        "id": "richardyoung/smolvlm2-2.2b-instruct",
-        "display": "SmolVLM2 2.2B",
-        "size": "~1.1 GB",
-        "size_gb": 1.1,
-    },
-    {"id": "minicpm-o:4b", "display": "MiniCPM-o 4B", "size": "~5.0 GB", "size_gb": 5.0},
-    {"id": "qwen3-vl:4b", "display": "Qwen3-VL 4B", "size": "~3.3 GB", "size_gb": 3.3},
-    {"id": "qwen2.5-vl:7b", "display": "Qwen2.5-VL 7B", "size": "~5.5 GB", "size_gb": 5.5},
-    {"id": "qwen2-vl:7b", "display": "Qwen2-VL 7B", "size": "~5.5 GB", "size_gb": 5.5},
-    {"id": "minicpm-v", "display": "MiniCPM-V 2.6", "size": "~5.5 GB", "size_gb": 5.5},
-    {"id": "bakllava", "display": "BakLLaVA 7B", "size": "~4.7 GB", "size_gb": 4.7},
-    {
-        "id": "llama3.2-vision:11b",
-        "display": "Llama 3.2-Vision 11B",
-        "size": "~7.9 GB",
-        "size_gb": 7.9,
-    },
+
+MODELS = [
+    ModelSpec(
+        "minicpm-v4.6:1b",
+        "MiniCPM-V 4.6 1B",
+        1.6,
+        "https://ollama.com/library/minicpm-v4.6",
+    ),
+    ModelSpec(
+        "qwen3.5:0.8b", "Qwen 3.5 0.8B", 1.0, "https://ollama.com/library/qwen3.5"
+    ),
+    ModelSpec("qwen3.5:2b", "Qwen 3.5 2B", 2.7, "https://ollama.com/library/qwen3.5"),
+    ModelSpec("qwen3.5:4b", "Qwen 3.5 4B", 3.4, "https://ollama.com/library/qwen3.5"),
+    ModelSpec("glm-ocr:latest", "GLM-OCR", 2.2, "https://ollama.com/library/glm-ocr"),
+    ModelSpec("qwen3-vl:2b", "Qwen3-VL 2B", 1.9, "https://ollama.com/library/qwen3-vl"),
+    ModelSpec("qwen3-vl:4b", "Qwen3-VL 4B", 3.3, "https://ollama.com/library/qwen3-vl"),
+    ModelSpec(
+        "granite3.2-vision:2b",
+        "Granite 3.2 Vision 2B",
+        2.4,
+        "https://ollama.com/library/granite3.2-vision",
+    ),
+    ModelSpec(
+        "ministral-3:3b",
+        "Ministral 3 3B",
+        3.0,
+        "https://ollama.com/library/ministral-3",
+    ),
+    ModelSpec("gemma3:4b", "Gemma 3 4B", 3.3, "https://ollama.com/library/gemma3"),
+    ModelSpec(
+        "minicpm-v4.5:8b",
+        "MiniCPM-V 4.5 8B",
+        6.1,
+        "https://ollama.com/library/minicpm-v4.5",
+    ),
+    ModelSpec(
+        "deepseek-ocr:3b",
+        "DeepSeek-OCR 3B",
+        6.7,
+        "https://ollama.com/library/deepseek-ocr",
+    ),
+    ModelSpec(
+        "minicpm-v:8b", "MiniCPM-V 2.6 8B", 5.5, "https://ollama.com/library/minicpm-v"
+    ),
+    ModelSpec(
+        "llama3.2-vision:11b",
+        "Llama 3.2 Vision 11B",
+        7.8,
+        "https://ollama.com/library/llama3.2-vision",
+    ),
+    ModelSpec(
+        "moondream:1.8b",
+        "Moondream 2 1.8B",
+        1.7,
+        "https://ollama.com/library/moondream",
+    ),
 ]
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
 
-@dataclass
-class ImageResult:
-    filename: str
-    expected: str
-    response: str
-    correct: bool
-    latency_s: float
-    error: Optional[str] = None
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-@dataclass
-class ModelResult:
-    model_id: str
-    display_name: str
-    size_label: str
-    pull_time_s: float
-    skipped: bool = False
-    skip_reason: str = ""
-    archived: bool = False   # True → benchmarked in a prior run, no longer on disk
-    image_results: list = field(default_factory=list)
-
-    @property
-    def accuracy(self) -> float:
-        if not self.image_results:
-            return 0.0
-        return self.correct_count / len(self.image_results)
-
-    @property
-    def correct_count(self) -> int:
-        return sum(r.correct for r in self.image_results)
-
-    @property
-    def avg_latency_s(self) -> float:
-        valid = [r for r in self.image_results if r.error is None]
-        if not valid:
-            return float("nan")
-        return sum(r.latency_s for r in valid) / len(valid)
-
-
-# ---------------------------------------------------------------------------
-# Archived results from prior runs (models removed from disk after testing)
-# ---------------------------------------------------------------------------
-
-ARCHIVED_RESULTS: list[ModelResult] = [
-    # ── 100 % ───────────────────────────────────────────────────────────────
-    ModelResult("llama3.2-vision:11b",     "Llama 3.2-Vision 11B", "~7.9 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "79,49", True,  18.4),
-        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,   8.3),
-        ImageResult("slip2_1093.jpg", "10,93", "10,93", True,   7.9),
-    ]),
-    ModelResult("qwen3-vl:4b",             "Qwen3-VL 4B",          "~3.3 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "79,49", True,  29.1),
-        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,   5.7),
-        ImageResult("slip2_1093.jpg", "10,93", "10,93", True,  11.0),
-    ]),
-    # ── 67 % ────────────────────────────────────────────────────────────────
-    ModelResult("moondream",               "Moondream 2",          "~1.7 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "79,49", True,  0.3),
-        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,  0.3),
-        ImageResult("slip2_1093.jpg", "10,93", "79,49", False, 0.3),
-    ]),
-    # MiniCPM-V errored in the automated benchmark run (VRAM flush timing);
-    # result below is from a verified standalone retest immediately after.
-    ModelResult("minicpm-v",               "MiniCPM-V 2.6",        "~5.5 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "66,80", False, 8.4),
-        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,  3.5),
-        ImageResult("slip2_1093.jpg", "10,93", "10,93", True,  3.6),
-    ]),
-    # ── 33 % ────────────────────────────────────────────────────────────────
-    ModelResult("bakllava",                "BakLLaVA 7B",          "~4.7 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "79,49", True,  2.6),
-        ImageResult("slip1_2841.jpg", "28,41", "79,49", False, 0.9),
-        ImageResult("slip2_1093.jpg", "10,93", "79,49", False, 0.9),
-    ]),
-    ModelResult("llava-phi3",              "LLaVA-Phi3",           "~2.9 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "85,01", False, 4.0),
-        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,  0.6),
-        ImageResult("slip2_1093.jpg", "10,93", "11,03", False, 0.6),
-    ]),
-    ModelResult("gemma3:4b",               "Gemma 3 4B",           "~3.3 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "12,69", False, 5.6),
-        ImageResult("slip1_2841.jpg", "28,41", "NaN",   False, 2.1),
-        ImageResult("slip2_1093.jpg", "10,93", "10,93", True,  2.1),
-    ]),
-    ModelResult("Keyvan/german-ocr-3",     "German-OCR-3",         "~2.7 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "NaN",   False, 93.8),
-        ImageResult("slip1_2841.jpg", "28,41", "28,41", True,  27.7),
-        ImageResult("slip2_1093.jpg", "10,93", "NaN",   False, 98.7),
-    ]),
-    # ── 0 % ─────────────────────────────────────────────────────────────────
-    ModelResult("llava:7b",                "LLaVA 1.5 7B",         "~4.7 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "NaN",   False, 2.7),
-        ImageResult("slip1_2841.jpg", "28,41", "NaN",   False, 0.9),
-        ImageResult("slip2_1093.jpg", "10,93", "NaN",   False, 0.9),
-    ]),
-    ModelResult("richardyoung/smolvlm2-2.2b-instruct", "SmolVLM2 2.2B", "~1.1 GB", 0, archived=True, image_results=[
-        ImageResult("slip0_7949.jpg", "79,49", "123,45", False, 1.4),
-        ImageResult("slip1_2841.jpg", "28,41", "79,49",  False, 0.2),
-        ImageResult("slip2_1093.jpg", "10,93", "79,49",  False, 0.2),
-    ]),
-    # ── not available in ollama registry ────────────────────────────────────
-    ModelResult("minicpm-o:4b",  "MiniCPM-o 4B",   "~5.0 GB", 0,
-                skipped=True, skip_reason="model not found in ollama registry"),
-    ModelResult("qwen2.5-vl:7b", "Qwen2.5-VL 7B",  "~5.5 GB", 0,
-                skipped=True, skip_reason="pull failed (disk / registry)"),
-    ModelResult("qwen2-vl:7b",   "Qwen2-VL 7B",    "~5.5 GB", 0,
-                skipped=True, skip_reason="pull failed (disk / registry)"),
-]
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def installed_model_ids() -> set:
+def atomic_json(path: Path, data: dict) -> None:
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=path.name)
     try:
-        return {m.model for m in ollama.list().models}
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
     except Exception:
-        return set()
+        Path(temp).unlink(missing_ok=True)
+        raise
 
 
-def _is_installed(model_id: str) -> bool:
-    return model_id_is_available(model_id, installed_model_ids())
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def model_storage_path() -> Path:
-    """Return the configured Ollama model-storage location."""
-    return Path(os.environ.get("OLLAMA_MODELS", Path.home() / ".ollama" / "models"))
+def expected_cents(path: Path) -> int:
+    return int(path.stem.rsplit("_", 1)[1])
 
 
-def free_disk_gb(path: Path) -> float:
-    """Return free space for the filesystem containing *path*."""
-    existing = path
-    while not existing.exists() and existing != existing.parent:
-        existing = existing.parent
-    return shutil.disk_usage(existing).free / 1024 ** 3
+def installed() -> dict[str, dict]:
+    return {m.model: {"digest": m.digest, "size": m.size} for m in ollama.list().models}
 
 
-def pull_model(spec: dict, allow_downloads: bool) -> float:
-    """Use an installed model or explicitly and capacity-safely download it."""
-    model_id = spec["id"]
-    if _is_installed(model_id):
-        print(f"  [cache] {model_id} already installed")
+def storage_path() -> Path:
+    configured = os.environ.get("OLLAMA_MODELS")
+    if configured:
+        return Path(configured)
+    service_path = Path("/usr/share/ollama/.ollama/models")
+    return service_path if service_path.exists() else Path.home() / ".ollama/models"
+
+
+def service_configuration() -> str:
+    """Return the latest Ollama startup configuration without tail truncation."""
+    try:
+        return subprocess.check_output(
+            [
+                "journalctl",
+                "-u",
+                "ollama",
+                "-b",
+                "--no-pager",
+                "-g",
+                "OLLAMA_FLASH_ATTENTION",
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def free_gb(path: Path) -> float:
+    current = path
+    while not current.exists():
+        current = current.parent
+    return shutil.disk_usage(current).free / 1024**3
+
+
+def pull(spec: ModelSpec, allow: bool, reserve: float) -> float:
+    if spec.model in installed():
         return 0.0
-    if not allow_downloads:
-        raise RuntimeError("model is not installed; use --allow-downloads to pull it")
-
-    storage = model_storage_path()
-    free = free_disk_gb(storage)
-    required = float(spec["size_gb"]) + MIN_FREE_GB
+    if not allow:
+        raise RuntimeError("missing model; use --allow-downloads")
+    free = free_gb(storage_path())
+    required = spec.size_gb + reserve
     if free < required:
-        raise RuntimeError(
-            f"{free:.1f} GB free in {storage}; {required:.1f} GB required "
-            f"for the estimated model size plus {MIN_FREE_GB:.0f} GB reserve"
-        )
-    print(f"  [pull]  downloading {model_id} … ({free:.1f} GB free)", flush=True)
-    t0 = time.monotonic()
-    for chunk in ollama.pull(model_id, stream=True):
-        status = getattr(chunk, "status", "") or ""
-        if "pulling" in status or "success" in status:
-            print(f"\r         {status[:80]}    ", end="", flush=True)
+        raise RuntimeError(f"{free:.1f} GB free, {required:.1f} GB required")
+    start = time.monotonic()
+    for chunk in ollama.pull(spec.model, stream=True):
+        status = getattr(chunk, "status", "")
+        if status:
+            print(f"\r  pull: {status[:80]:80}", end="", flush=True)
     print()
-    return time.monotonic() - t0
+    return time.monotonic() - start
 
 
-def extract_expected(filename: str) -> str:
-    m = re.search(r"_(\d+)\.[^.]+$", filename)
-    if not m:
-        return "?"
-    cents = int(m.group(1))
-    return f"{cents // 100},{cents % 100:02d}"
-
-
-def parse_response(text: str) -> str:
-    price_cents = parse_price(text)
-    return format_price(price_cents) if price_cents is not None else "NaN"
-
-
-def run_model_on_image(model_id: str, image_path: Path) -> tuple[str, float]:
-    b64 = encode_image(image_path)
-    t0 = time.monotonic()
-    response = query_model(model_id, b64)
-    return response, time.monotonic() - t0
-
-
-# ---------------------------------------------------------------------------
-# Benchmark runner
-# ---------------------------------------------------------------------------
-
-def benchmark(model_specs: list[dict], allow_downloads: bool = False) -> list[ModelResult]:
-    test_images = sorted(TEST_IMAGES_DIR.glob("*.jpg"))
-    if not test_images:
-        sys.exit(f"No JPEG images found in {TEST_IMAGES_DIR}")
-
-    results: list[ModelResult] = []
-    for spec in model_specs:
-        mid = spec["id"]
-        print(f"\n{'='*60}\nModel: {spec['display']} ({mid})\n{'='*60}")
-
+def environment() -> dict:
+    def command(args: list[str]) -> str:
         try:
-            pull_time = pull_model(spec, allow_downloads)
-        except Exception as e:
-            print(f"  [skip] {e}")
-            results.append(ModelResult(mid, spec["display"], spec["size"], 0.0,
-                                       skipped=True, skip_reason=str(e)))
-            continue
+            return subprocess.check_output(
+                args, text=True, stderr=subprocess.STDOUT
+            ).strip()
+        except Exception as exc:
+            return f"unavailable: {exc}"
 
-        mr = ModelResult(mid, spec["display"], spec["size"], pull_time)
-
-        for img_path in test_images:
-            expected = extract_expected(img_path.name)
-            print(f"  image: {img_path.name}  expected={expected}", end=" … ", flush=True)
-            try:
-                raw, latency = run_model_on_image(mid, img_path)
-                parsed = parse_response(raw)
-                correct = (parsed == expected)
-                print(f"got='{parsed}'  {'OK' if correct else 'WRONG'}  {latency:.1f}s")
-                mr.image_results.append(ImageResult(img_path.name, expected,
-                                                     raw[:120], correct, latency))
-            except Exception as e:
-                print(f"ERROR: {e}")
-                mr.image_results.append(ImageResult(img_path.name, expected,
-                                                     "", False, 0.0, str(e)[:120]))
-
-        results.append(mr)
-
-        # Evict from VRAM
-        try:
-            ollama.chat(model=mid,
-                        messages=[{"role": "user", "content": "."}],
-                        options={"num_predict": 1, "keep_alive": "0"})
-        except Exception:
-            pass
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# PDF report
-# ---------------------------------------------------------------------------
-
-# Accuracy colour bands
-def acc_color(pct: float) -> colors.Color:
-    if pct >= 1.0:
-        return colors.HexColor("#1e8449")  # green
-    if pct >= 0.67:
-        return colors.HexColor("#d4ac0d")  # gold
-    if pct >= 0.33:
-        return colors.HexColor("#e67e22")  # orange
-    return colors.HexColor("#c0392b")  # red
-
-
-def build_pdf(live_results: list[ModelResult], gpu_info: str):
-    # A live result supersedes an archived result for the same model.
-    live_ids = {result.model_id for result in live_results}
-    all_results = live_results + [
-        result for result in ARCHIVED_RESULTS if result.model_id not in live_ids
-    ]
-    ranked = sorted(
-        [r for r in all_results if not r.skipped],
-        key=lambda r: (-r.accuracy, r.avg_latency_s if r.avg_latency_s == r.avg_latency_s else 9999)
+    journal = service_configuration()
+    configured_storage = re.findall(r"OLLAMA_MODELS:([^ ]+)", journal)
+    model_storage = os.environ.get("OLLAMA_MODELS") or (
+        configured_storage[-1] if configured_storage else str(storage_path())
     )
-    skipped = [r for r in all_results if r.skipped]
-
-    doc = SimpleDocTemplate(
-        str(OUTPUT_PDF), pagesize=A4,
-        leftMargin=1.8*cm, rightMargin=1.8*cm,
-        topMargin=1.8*cm, bottomMargin=1.8*cm,
-    )
-    styles = getSampleStyleSheet()
-
-    def style(name, **kw):
-        s = ParagraphStyle(name, parent=styles["Normal"], **kw)
-        return s
-
-    title_s  = style("T",  fontSize=18, fontName="Helvetica-Bold", spaceAfter=2)
-    sub_s    = style("S",  fontSize=8,  textColor=colors.HexColor("#555555"), spaceAfter=6)
-    h2_s     = style("H2", fontSize=10, fontName="Helvetica-Bold", spaceBefore=10, spaceAfter=4)
-    body_s   = style("B",  fontSize=8,  leading=11)
-    note_s   = style("N",  fontSize=6,  textColor=colors.grey, leading=8)
-
-    story = []
-
-    # ── Header ──────────────────────────────────────────────────────────────
-    story.append(Paragraph("Vision Model Benchmark", title_s))
-    story.append(Paragraph(
-        f"German Sales-Slip OCR &nbsp;·&nbsp; {datetime.now().strftime('%Y-%m-%d')} "
-        f"&nbsp;·&nbsp; {gpu_info}",
-        sub_s
-    ))
-    story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2c3e50")))
-    story.append(Spacer(1, 0.25*cm))
-
-    story.append(Paragraph(
-        "<b>Task:</b> Extract the total amount from German grocery / gas sales slips. "
-        "Each model receives the raw JPEG (resized ≤ 1500 px longest side) and a fixed "
-        "prompt asking for the sum in <i>Euro,Cent</i> format. "
-        "<b>Smoke-test exact-match rate</b> = share of 3 annotated test images where the extracted value "
-        "matches the ground truth encoded in the filename "
-        "(<i>slip0_7949.jpg</i> → 79,49 €). "
-        "This tiny convenience sample is not an estimate of production accuracy. "
-        "Models marked <i>archived</i> were tested in an earlier run and removed from "
-        f"disk afterwards. Archived measurements: {ARCHIVED_RUN}.",
-        body_s
-    ))
-    story.append(Spacer(1, 0.35*cm))
-
-    # ── Leaderboard ─────────────────────────────────────────────────────────
-    story.append(Paragraph("Leaderboard", h2_s))
-
-    hdr = ["#", "Model", "Size", "Accuracy", "Avg latency", "On disk"]
-    rows = [hdr]
-    row_colors = []
-
-    for rank, mr in enumerate(ranked, 1):
-        n_total = len(mr.image_results)
-        acc_str = f"{mr.correct_count}/{n_total}  ({mr.accuracy*100:.0f} %)"
-        lat = f"{mr.avg_latency_s:.1f} s" if mr.avg_latency_s == mr.avg_latency_s else "—"
-        on_disk = "archived" if mr.archived else "✓"
-        rows.append([str(rank), mr.display_name, mr.size_label, acc_str, lat, on_disk])
-        row_colors.append(mr.accuracy)
-
-    cw = [0.7*cm, 4.5*cm, 1.8*cm, 3.2*cm, 2.5*cm, 2.0*cm]
-    tbl = Table(rows, colWidths=cw, repeatRows=1)
-
-    ts = [
-        # Header
-        ("BACKGROUND",   (0,0), (-1,0), colors.HexColor("#2c3e50")),
-        ("TEXTCOLOR",    (0,0), (-1,0), colors.white),
-        ("FONTNAME",     (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE",     (0,0), (-1,-1), 7.5),
-        ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, colors.HexColor("#f5f5f5")]),
-        ("GRID",         (0,0), (-1,-1), 0.3, colors.HexColor("#cccccc")),
-        ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING",   (0,0), (-1,-1), 4),
-        ("BOTTOMPADDING",(0,0), (-1,-1), 4),
-        ("LEFTPADDING",  (0,0), (-1,-1), 5),
-        ("RIGHTPADDING", (0,0), (-1,-1), 5),
-        ("ALIGN",        (0,0), (0,-1), "CENTER"),   # rank col
-        ("ALIGN",        (3,0), (4,-1), "RIGHT"),    # acc + latency
-        ("FONTNAME",     (0,1), (0,-1), "Helvetica-Bold"),  # rank bold
-    ]
-    # Colour-code the accuracy cell per row
-    for i, pct in enumerate(row_colors, 1):
-        c = acc_color(pct)
-        ts.append(("TEXTCOLOR", (3, i), (3, i), c))
-        ts.append(("FONTNAME",  (3, i), (3, i), "Helvetica-Bold"))
-
-    tbl.setStyle(TableStyle(ts))
-    story.append(tbl)
-    story.append(Spacer(1, 0.5*cm))
-
-    # ── Per-model detail ────────────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#bbbbbb")))
-    story.append(Paragraph("Per-model responses", h2_s))
-
-    for mr in ranked + skipped:
-        label = mr.display_name
-        if mr.archived:
-            label += "  <font color='#888888' size='6'>(archived)</font>"
-        if mr.skipped:
-            label += "  <font color='#c0392b' size='6'>(skipped)</font>"
-
-        block = [Paragraph(f"<b>{label}</b>  <font size='6.5' color='#666666'>{mr.model_id}</font>", body_s)]
-
-        if mr.skipped:
-            block.append(Paragraph(f"Not tested — {mr.skip_reason}", note_s))
-        else:
-            det_hdr = ["Image", "Expected", "Model response", "Parsed", "✓/✗", "Time"]
-            det_rows = [det_hdr]
-            for ir in mr.image_results:
-                parsed = parse_response(ir.response) if not ir.error else "ERR"
-                raw_cell = (ir.error or ir.response.replace("\n", " "))[:90]
-                det_rows.append([
-                    ir.filename, ir.expected, raw_cell, parsed,
-                    "✓" if ir.correct else "✗",
-                    f"{ir.latency_s:.1f} s" if not ir.error else "—"
-                ])
-
-            dcw = [2.5*cm, 1.7*cm, 6.2*cm, 1.5*cm, 0.8*cm, 1.8*cm]
-            dt = Table(det_rows, colWidths=dcw, repeatRows=1)
-            dts = [
-                ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#455a64")),
-                ("TEXTCOLOR",     (0,0), (-1,0), colors.white),
-                ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
-                ("FONTSIZE",      (0,0), (-1,-1), 6.5),
-                ("LEADING",       (0,0), (-1,-1), 9),
-                ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, colors.HexColor("#eceff1")]),
-                ("GRID",          (0,0), (-1,-1), 0.25, colors.HexColor("#cccccc")),
-                ("VALIGN",        (0,0), (-1,-1), "TOP"),
-                ("TOPPADDING",    (0,0), (-1,-1), 3),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 3),
-                ("LEFTPADDING",   (0,0), (-1,-1), 4),
-                ("RIGHTPADDING",  (0,0), (-1,-1), 4),
-                ("ALIGN",         (4,1), (5,-1), "CENTER"),
+    return {
+        "ollama": command(["ollama", "--version"]),
+        "gpu": command(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,driver_version",
+                "--format=csv,noheader",
             ]
-            # Colour ✓/✗ per row
-            for ri, ir in enumerate(mr.image_results, 1):
-                c = colors.HexColor("#1e8449") if ir.correct else colors.HexColor("#c0392b")
-                dts.append(("TEXTCOLOR", (4, ri), (4, ri), c))
-                dts.append(("FONTNAME",  (4, ri), (4, ri), "Helvetica-Bold"))
-            dt.setStyle(TableStyle(dts))
-            block.append(dt)
-
-        block.append(Spacer(1, 0.3*cm))
-        story.append(KeepTogether(block))
-
-    # ── Footer ───────────────────────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#cccccc")))
-    story.append(Spacer(1, 0.1*cm))
-    story.append(Paragraph(f"<b>Prompt:</b> {PROMPT}", note_s))
-    story.append(Paragraph(
-        f"Test images: {TEST_IMAGES_DIR} &nbsp;·&nbsp; "
-        f"Max image side: {MAX_SIDE_PX} px &nbsp;·&nbsp; temperature=0",
-        note_s
-    ))
-
-    doc.build(story)
-    print(f"\n[pdf] written → {OUTPUT_PDF}")
+        ),
+        "flash_attention": "true"
+        if "OLLAMA_FLASH_ATTENTION:true" in journal
+        else "false",
+        "kv_cache": "f16",
+        "model_storage": model_storage,
+        "free_gb_start": round(free_gb(storage_path()), 2),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def new_results(specs: list[ModelSpec], runs: int) -> dict:
+    images = sorted(IMAGES.glob("*.jpg"))
+    return {
+        "schema": SCHEMA,
+        "started_at": now(),
+        "completed_at": None,
+        "active_seconds": 0.0,
+        "runs_per_image": runs,
+        "prompt_sha256": hashlib.sha256(PROMPT.encode()).hexdigest(),
+        "images": {
+            p.name: {"sha256": sha256(p), "expected_cents": expected_cents(p)}
+            for p in images
+        },
+        "catalog": [asdict(s) for s in specs],
+        "environment": environment(),
+        "installed_before": installed(),
+        "models": {
+            s.model: {
+                "status": "pending",
+                "pull_seconds": 0.0,
+                "trials": [],
+                "error": None,
+            }
+            for s in specs
+        },
+        "storage_actions": [],
+    }
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    """Parse explicit model selections for a benchmark run."""
+
+def validate(data: dict, specs: list[ModelSpec], runs: int) -> None:
+    expected = new_results(specs, runs)
+    for key in ("schema", "runs_per_image", "prompt_sha256", "images", "catalog"):
+        if data.get(key) != expected[key]:
+            raise RuntimeError(f"cannot resume: {key} changed; use --fresh")
+    current = environment()
+    for key in ("ollama", "gpu", "flash_attention", "kv_cache"):
+        if data["environment"].get(key) != current.get(key):
+            raise RuntimeError(f"cannot resume: environment {key} changed; use --fresh")
+
+
+def summary(spec: ModelSpec, result: dict) -> dict:
+    trials = result["trials"]
+    latencies = [t["wall_seconds"] for t in trials if not t["error"]]
+    correct = sum(t["correct"] for t in trials)
+    stable = sum(
+        all(t["correct"] for t in trials if t["image"] == image)
+        for image in {t["image"] for t in trials}
+    )
+    return {
+        "model": spec.model,
+        "name": spec.name,
+        "size_gb": spec.size_gb,
+        "correct": correct,
+        "total": len(trials),
+        "accuracy": correct / len(trials) if trials else 0,
+        "stable": stable,
+        "median": statistics.median(latencies) if latencies else float("inf"),
+        "mean": statistics.mean(latencies) if latencies else float("inf"),
+        "cold": latencies[0] if latencies else float("inf"),
+        "warm": statistics.median(latencies[1:])
+        if len(latencies) > 1
+        else float("inf"),
+        "errors": sum(bool(t["error"]) for t in trials),
+    }
+
+
+def ranked(data: dict, specs: list[ModelSpec]) -> list[dict]:
+    rows = [summary(s, data["models"][s.model]) for s in specs]
+    return sorted(
+        rows, key=lambda r: (-r["accuracy"], -r["stable"], r["warm"], r["size_gb"])
+    )
+
+
+def recommend(rows: list[dict]) -> dict | None:
+    perfect = [
+        r for r in rows if r["total"] and r["accuracy"] == 1 and r["stable"] == 3
+    ]
+    if not perfect:
+        return None
+    fastest = min(r["warm"] for r in perfect)
+    eligible = [r for r in perfect if r["warm"] <= fastest * 1.5]
+    return min(eligible, key=lambda r: (r["size_gb"], r["warm"]))
+
+
+def write_markdown(data: dict, specs: list[ModelSpec]) -> None:
+    rows, winner = ranked(data, specs), recommend(ranked(data, specs))
+    lines = [
+        "# Compact Vision Model Receipt Benchmark",
+        "",
+        "> Three receipts × three runs is a smoke test, not production accuracy.",
+        "",
+        f"Environment: {data['environment']['gpu']}; {data['environment']['ollama']}; Flash Attention `{data['environment']['flash_attention']}`; KV cache `{data['environment']['kv_cache']}`.",
+        "",
+        f"Total active benchmark time: **{data['active_seconds'] / 60:.1f} minutes**. Recommendation: **{winner['name'] if winner else 'none'}**.",
+        "",
+        "| # | Model | Exact | Stable | Warm median | Cold | Size | Errors |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for i, r in enumerate(rows, 1):
+        warm = f"{r['warm']:.2f}s" if r["warm"] != float("inf") else "—"
+        cold = f"{r['cold']:.2f}s" if r["cold"] != float("inf") else "—"
+        lines.append(
+            f"| {i} | {r['name']} | {r['correct']}/{r['total']} | {r['stable']}/3 | {warm} | {cold} | {r['size_gb']:.1f} GB | {r['errors']} |"
+        )
+    lines += ["", "## Storage actions", ""] + (
+        [f"- `{a['model']}` removed: {a['reason']}" for a in data["storage_actions"]]
+        or ["- None."]
+    )
+    lines += [
+        "",
+        "## Method",
+        "",
+        f"Images were resized to at most {MAX_SIDE_PX}px, thinking was disabled, temperature was zero, and exact `Euro,Cent` responses were scored. Failed trials remain in the denominator.",
+    ]
+    RESULT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_pdf(data: dict, specs: list[ModelSpec]) -> None:
+    rows, winner = ranked(data, specs), recommend(ranked(data, specs))
+    width, height = landscape(A4)
+    c = canvas.Canvas(str(RESULT_PDF), pagesize=(width, height), pageCompression=1)
+    navy, teal, pale = (
+        colors.HexColor("#152238"),
+        colors.HexColor("#13A89E"),
+        colors.HexColor("#EEF4F7"),
+    )
+    c.setFillColor(navy)
+    c.rect(0, height - 82, width, 82, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 22)
+    c.drawString(28, height - 38, "Local Vision OCR Benchmark")
+    c.setFont("Helvetica", 8)
+    c.drawString(
+        28,
+        height - 58,
+        f"3 receipts × 3 runs · {data['environment']['gpu']} · Flash Attention {data['environment']['flash_attention']} · f16 KV",
+    )
+    cards = [
+        ("MODELS", str(len(rows))),
+        ("TRIALS", str(sum(r["total"] for r in rows))),
+        ("TOTAL TIME", f"{data['active_seconds'] / 60:.1f} min"),
+        ("RECOMMENDATION", winner["name"] if winner else "None"),
+    ]
+    x = 28
+    for label, value in cards:
+        w = 188 if label == "RECOMMENDATION" else 110
+        c.setFillColor(pale)
+        c.roundRect(x, height - 135, w, 40, 7, fill=1, stroke=0)
+        c.setFillColor(navy)
+        c.setFont("Helvetica-Bold", 7)
+        c.drawString(x + 9, height - 108, label)
+        c.setFont("Helvetica-Bold", 12 if label != "RECOMMENDATION" else 9)
+        c.drawString(x + 9, height - 126, value[:30])
+        x += w + 9
+    y = height - 160
+    columns = [
+        (28, "#"),
+        (48, "Model"),
+        (270, "Exact"),
+        (320, "Stable"),
+        (375, "Warm"),
+        (430, "Cold"),
+        (485, "Size"),
+        (535, "Err"),
+    ]
+    c.setFillColor(navy)
+    c.rect(24, y - 14, width - 48, 22, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 8)
+    for x, label in columns:
+        c.drawString(x, y - 7, label)
+    y -= 24
+    for i, r in enumerate(rows, 1):
+        if winner and r["model"] == winner["model"]:
+            c.setFillColor(colors.HexColor("#DDF6F2"))
+            c.rect(24, y - 5, width - 48, 20, fill=1, stroke=0)
+        elif i % 2 == 0:
+            c.setFillColor(colors.HexColor("#F5F7F9"))
+            c.rect(24, y - 5, width - 48, 20, fill=1, stroke=0)
+        c.setFillColor(teal if winner and r["model"] == winner["model"] else navy)
+        c.setFont("Helvetica-Bold" if i <= 3 else "Helvetica", 8)
+        values = [
+            str(i),
+            r["name"],
+            f"{r['correct']}/{r['total']}",
+            f"{r['stable']}/3",
+            f"{r['warm']:.2f}s" if r["warm"] != float("inf") else "—",
+            f"{r['cold']:.2f}s" if r["cold"] != float("inf") else "—",
+            f"{r['size_gb']:.1f}G",
+            str(r["errors"]),
+        ]
+        for (x, _), value in zip(columns, values):
+            c.drawString(x, y, value[:34])
+        y -= 20
+    c.setFillColor(navy)
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(28, 54, "Key finding")
+    c.setFont("Helvetica", 8)
+    finding = (
+        f"{winner['name']} is the recommended smallest near-fastest perfect model."
+        if winner
+        else "No model was perfect across all nine trials."
+    )
+    c.drawString(28, 40, finding)
+    c.setFillColor(colors.HexColor("#607080"))
+    c.setFont("Helvetica", 7)
+    c.drawString(
+        28,
+        23,
+        "Smoke test only: three annotated German receipts; errors count as incorrect. Warm median excludes the first model request.",
+    )
+    c.showPage()
+    c.save()
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--model",
-        action="append",
-        choices=[spec["id"] for spec in MODELS],
-        help="model to run; repeat to select more than one",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="run every configured model",
-    )
-    parser.add_argument(
-        "--allow-downloads",
-        action="store_true",
-        help="allow selected missing models to be downloaded after a capacity check",
-    )
+    parser.add_argument("--model", action="append", choices=[s.model for s in MODELS])
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--allow-downloads", action="store_true")
+    parser.add_argument("--fresh", action="store_true")
+    parser.add_argument("--min-free-gb", type=float, default=10)
+    parser.add_argument("--evict-poor", action="store_true")
+    parser.add_argument("--poor-threshold", type=float, default=0.5)
     args = parser.parse_args(argv)
+    if not args.all and not args.model:
+        parser.error("select --all or at least one --model")
     if args.all and args.model:
-        parser.error("--all and --model cannot be combined")
+        parser.error("--all and --model are mutually exclusive")
     return args
 
 
-def selected_models(args: argparse.Namespace) -> list[dict]:
-    """Resolve command-line selections to model specifications."""
-    if args.all:
-        return MODELS
-    selected_ids = set(args.model or [])
-    return [spec for spec in MODELS if spec["id"] in selected_ids]
-
-def gpu_info() -> str:
-    try:
-        return subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            text=True
-        ).strip()
-    except Exception:
-        return "GPU info unavailable"
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    """Run selected models and rebuild the archived/live smoke-test report."""
+def main(argv=None) -> int:
     args = parse_args(argv)
-    model_specs = selected_models(args)
-    print("=== Local Vision Model Benchmark ===")
-    print(f"GPU: {gpu_info()}")
-    print(f"Test images: {TEST_IMAGES_DIR}")
-    print(f"Models to run: {len(model_specs)}  (+{len(ARCHIVED_RESULTS)} archived)")
+    specs = MODELS if args.all else [s for s in MODELS if s.model in args.model]
+    if args.fresh:
+        RESULT_JSON.unlink(missing_ok=True)
+    data = (
+        json.loads(RESULT_JSON.read_text())
+        if RESULT_JSON.exists()
+        else new_results(specs, args.runs)
+    )
+    if RESULT_JSON.exists():
+        validate(data, specs, args.runs)
+    session = time.monotonic()
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
 
-    live = benchmark(model_specs, allow_downloads=args.allow_downloads)
+    def interrupt(_signum, _frame):
+        raise KeyboardInterrupt
 
-    print("\n=== Building PDF report ===")
-    build_pdf(live, gpu_info())
-
-    all_res = live + ARCHIVED_RESULTS
-    ranked = sorted([r for r in all_res if not r.skipped],
-                    key=lambda r: (-r.accuracy, r.avg_latency_s
-                                  if r.avg_latency_s == r.avg_latency_s else 9999))
-    print(f"\n{'#':<3} {'Model':<28} {'Acc':>6}  {'Avg lat':>9}  {'Disk'}")
-    print("-" * 58)
-    for i, mr in enumerate(ranked, 1):
-        lat = f"{mr.avg_latency_s:.1f}s" if mr.avg_latency_s == mr.avg_latency_s else "N/A"
-        flag = "archived" if mr.archived else "on disk"
-        print(f"{i:<3} {mr.display_name:<28} {mr.accuracy*100:>5.0f}%  {lat:>9}  {flag}")
-    for mr in [r for r in all_res if r.skipped]:
-        print(f"{'—':<3} {mr.display_name:<28}  skip   —          skipped")
-    return 0
+    signal.signal(signal.SIGTERM, interrupt)
+    encoded = {p.name: encode_image(p) for p in sorted(IMAGES.glob("*.jpg"))}
+    try:
+        for spec in specs:
+            result = data["models"][spec.model]
+            print(f"\n=== {spec.name} ({spec.model}) ===", flush=True)
+            try:
+                result["pull_seconds"] += pull(
+                    spec, args.allow_downloads, args.min_free_gb
+                )
+                info = installed().get(spec.model, {})
+                result.update(
+                    {
+                        "digest": info.get("digest"),
+                        "actual_size": info.get("size"),
+                        "status": "running",
+                    }
+                )
+                atomic_json(RESULT_JSON, data)
+                done = {(t["image"], t["run"]) for t in result["trials"]}
+                for image, meta in data["images"].items():
+                    for run in range(1, args.runs + 1):
+                        if (image, run) in done:
+                            continue
+                        start = time.monotonic()
+                        trial = {
+                            "image": image,
+                            "run": run,
+                            "expected_cents": meta["expected_cents"],
+                            "response": "",
+                            "parsed_cents": None,
+                            "correct": False,
+                            "wall_seconds": 0.0,
+                            "api_total_seconds": None,
+                            "load_seconds": None,
+                            "prompt_eval_seconds": None,
+                            "eval_seconds": None,
+                            "error": None,
+                            "at": now(),
+                        }
+                        try:
+                            response = ollama.chat(
+                                model=spec.model,
+                                messages=[
+                                    {
+                                        "role": "user",
+                                        "content": PROMPT,
+                                        "images": [encoded[image]],
+                                    }
+                                ],
+                                think=False,
+                                options={
+                                    "temperature": 0,
+                                    "num_ctx": 4096,
+                                    "num_predict": 64,
+                                },
+                                keep_alive="5m",
+                            )
+                            trial["response"] = response.message.content.strip()
+                            trial["parsed_cents"] = parse_price(trial["response"])
+                            trial["correct"] = (
+                                trial["parsed_cents"] == meta["expected_cents"]
+                            )
+                            for field, target in (
+                                ("total_duration", "api_total_seconds"),
+                                ("load_duration", "load_seconds"),
+                                ("prompt_eval_duration", "prompt_eval_seconds"),
+                                ("eval_duration", "eval_seconds"),
+                            ):
+                                value = getattr(response, field, None)
+                                trial[target] = (
+                                    value / 1e9 if value is not None else None
+                                )
+                        except Exception as exc:
+                            trial["error"] = f"{type(exc).__name__}: {exc}"[:500]
+                        trial["wall_seconds"] = round(time.monotonic() - start, 4)
+                        result["trials"].append(trial)
+                        atomic_json(RESULT_JSON, data)
+                        print(
+                            f"  {image} run {run}: {'OK' if trial['correct'] else 'FAIL'} {trial['wall_seconds']:.2f}s {trial['response'][:50]!r}",
+                            flush=True,
+                        )
+                result["status"] = "complete"
+                ollama.generate(model=spec.model, prompt="", keep_alive=0)
+                atomic_json(RESULT_JSON, data)
+            except Exception as exc:
+                result["status"] = "failed"
+                result["error"] = f"{type(exc).__name__}: {exc}"
+                atomic_json(RESULT_JSON, data)
+                print(f"  MODEL FAILED: {exc}", flush=True)
+        if args.evict_poor:
+            before = set(data["installed_before"])
+            before_digests = {
+                value.get("digest") for value in data["installed_before"].values()
+            }
+            winner = recommend(ranked(data, specs))
+            keep = winner["model"] if winner else None
+            for spec in specs:
+                row = summary(spec, data["models"][spec.model])
+                digest = data["models"][spec.model].get("digest")
+                if (
+                    spec.model not in before
+                    and digest not in before_digests
+                    and spec.model != keep
+                    and row["total"] == args.runs * len(data["images"])
+                    and row["accuracy"] < args.poor_threshold
+                ):
+                    ollama.delete(spec.model)
+                    data["storage_actions"].append(
+                        {
+                            "model": spec.model,
+                            "at": now(),
+                            "reason": f"accuracy {row['accuracy']:.0%} below {args.poor_threshold:.0%}",
+                        }
+                    )
+                    atomic_json(RESULT_JSON, data)
+        data["active_seconds"] += time.monotonic() - session
+        data["completed_at"] = now()
+        data["environment"]["free_gb_end"] = round(free_gb(storage_path()), 2)
+        atomic_json(RESULT_JSON, data)
+        write_markdown(data, specs)
+        write_pdf(data, specs)
+        return 0
+    except KeyboardInterrupt:
+        data["active_seconds"] += time.monotonic() - session
+        atomic_json(RESULT_JSON, data)
+        return 130
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
