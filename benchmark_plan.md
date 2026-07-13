@@ -1,22 +1,22 @@
 # Receipt Vision-Model Benchmark Plan
 
-## Status at pause
+## Status: completed 2026-07-13
 
-Planning and market research are complete. The benchmark harness has not been
-rewritten, the multi-model sweep has not started, no models have been pulled,
-and no models have been deleted.
+The restart fixed NVML, Ollama was upgraded to 0.31.2, and its Python adapter
+was confirmed current at 0.6.2. The complete fresh sweep ran with the server
+defaults requested by the operator: Flash Attention disabled and f16 KV cache.
 
-One direct smoke call was made with the already-installed `qwen3-vl:4b` model
-and `test_images/slip2_1093.jpg`. It returned the correct `10,93`, took 60.62
-seconds including cold loading, and `ollama ps` reported `100% GPU`; the model
-was explicitly stopped after the test.
+All 15 models completed three runs on each of three receipts, producing 135
+persisted trials in 2337.5 seconds (39.0 minutes). Qwen 3.5 4B was the only
+9/9 model, with a 0.46-second warm median, and is now the scanner default.
 
-The session was paused because `nvidia-smi` failed with an NVML
-driver/library-version mismatch. Restart the machine before implementing or
-running the benchmark so GPU identification, memory reporting, and timing are
-reliable.
+The system Ollama store is on the space-constrained root filesystem, so the
+benchmark used an isolated server and model store at
+`/home/mpetrick/.cache/sales-slip-scanner-ollama/models`. It began with 168.76
+GB free and ended with 145.33 GB free after nine below-threshold candidates
+were removed; no model that predated the isolated run was touched.
 
-## Machine inventory before restart
+## Historical machine inventory before restart
 
 - Python: 3.14.6
 - Ollama server: 0.24.0
@@ -32,7 +32,7 @@ Installed Ollama models at the pause:
 
 | Model | Reported size | Role |
 |---|---:|---|
-| `qwen3-vl:4b` | 3.3 GB | Current scanner default and benchmark baseline |
+| `qwen3-vl:4b` | 3.3 GB | Scanner default at the pause and benchmark baseline |
 | `llama3.2-vision:11b` | 7.8 GB | Larger accuracy baseline |
 | `minicpm-v:latest` | 5.5 GB | Older OCR-oriented baseline |
 | `moondream:latest` | 1.7 GB | Older speed baseline |
@@ -79,7 +79,7 @@ The final run should include at least the following 15 candidates. This gives
 | 4 | `qwen3.5:4b` | 3.4 GB | New likely quality/size contender |
 | 5 | `glm-ocr:latest` | 2.2 GB | New 0.9B document/OCR specialist |
 | 6 | `qwen3-vl:2b` | 1.9 GB | Smaller version of the current winning family |
-| 7 | `qwen3-vl:4b` | 3.3 GB | Current scanner default |
+| 7 | `qwen3-vl:4b` | 3.3 GB | Previous scanner default |
 | 8 | `granite3.2-vision:2b` | 2.4 GB | Compact document-understanding specialist |
 | 9 | `ministral-3:3b` | 3.0 GB | Recent edge-focused multilingual vision model |
 | 10 | `gemma3:4b` | 3.3 GB | Well-known multilingual compact baseline |
@@ -244,3 +244,21 @@ GPU benchmark results.
 8. Update README/model documentation with measured, qualified claims.
 9. Run the final pipeline and commit implementation, measured data, report,
    and documentation in focused commits.
+
+## Completion record
+
+- [x] NVIDIA GPU and Ollama 0.31.2 verified after restart.
+- [x] Ollama Python adapter 0.6.2 verified as the current stable release.
+- [x] Resumable, atomic-checkpoint benchmark harness implemented and tested.
+- [x] Fifteen current compact models run for three trials per receipt.
+- [x] Accuracy, cold/warm runtime, total duration, errors, model sizes, digests,
+  environment, and storage actions persisted.
+- [x] Nine newly downloaded candidates below 50% removed safely.
+- [x] Markdown, trial-level JSON, and one-page landscape A4 PDF published.
+- [x] Qwen 3.5 4B selected and verified through the production scanner path.
+- [x] README and model shortlist updated with qualified measured claims.
+- [x] Python 3.14.6 local pipeline passed with 74 tests and 96.71% coverage.
+
+Measured artifacts: [`results.md`](localVisionModelTest/results.md),
+[`results.json`](localVisionModelTest/results.json), and
+[`results.pdf`](localVisionModelTest/results.pdf).

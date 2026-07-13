@@ -20,7 +20,7 @@ From the 2024-version - not right anymore - we run a local vision-model!
 
 Two years ago I built [a quick proof-of-concept](https://github.com/marcelpetrick/codingWithGPT/tree/master/SalesSlipScanner) that extracted totals from German grocery receipts by sending them to the OpenAI API. It worked — and cost me exactly **15 cents** in API credits for the test run. I wrote it in about an hour and moved on.
 
-Fast forward to 2026: local vision models have caught up. In a small smoke test of **10 models** on the same three receipts, **Qwen3-VL 4B** (3.3 GB) extracted all three totals correctly — completely offline, with no per-inference fee and no receipt sent to a remote service.
+Fast forward to 2026: local vision models have caught up. In a fresh smoke test of **15 models** and 135 total trials, **Qwen 3.5 4B** (3.4 GB) extracted every receipt total correctly in all three repetitions — completely offline, with no per-inference fee and no receipt sent to a remote service.
 
 This repository is the next generation: the same idea, fully local, tested, and backed by a repeatable local quality pipeline.
 
@@ -47,7 +47,7 @@ No unprocessed image files found in: .../input/
 ❯ cp test_images/slip*.jpg input/
 
 ❯ python salesSlipScanner.py
-Found 3 file(s)  [model: qwen3-vl:4b]
+Found 3 file(s)  [model: qwen3.5:4b]
 
   slip0.jpg … OK  →  slip0_7949.jpg  (79,49 €)
   slip1.jpg … OK  →  slip1_2841.jpg  (28,41 €)
@@ -64,21 +64,19 @@ Found 3 file(s)  [model: qwen3-vl:4b]
 
 ## Benchmark
 
-Ten vision models were smoke-tested on three annotated German grocery/gas receipts
-(ground truth encoded in the filename, e.g. `slip0_7949.jpg` = 79,49 €).
-Full results are in [`localVisionModelTest/results.pdf`](localVisionModelTest/results.pdf).
-Three examples are not enough to estimate production accuracy; the percentages below only describe exact matches in this fixed convenience sample.
+Fifteen vision models were tested on three annotated German grocery/gas receipts, with three runs per image. Full trial data and compatibility errors are in [`results.md`](localVisionModelTest/results.md), [`results.json`](localVisionModelTest/results.json), and the [one-page PDF](localVisionModelTest/results.pdf).
 
-| # | Model | Smoke-test exact matches | Avg latency | Result state |
-|---|-------|--------------------------|-------------|--------------|
-| 1 | **Llama 3.2-Vision 11B** | **3/3** | 11.5 s | archived |
-| 2 | **Qwen3-VL 4B** ← default | **3/3** | 15.3 s | archived |
-| 3 | Moondream 2 | 2/3 | **0.3 s** | archived |
-| 4 | MiniCPM-V 2.6 | 2/3 | 5.2 s | archived |
-| 5–8 | BakLLaVA / LLaVA-Phi3 / Gemma 3 / German-OCR-3 | 1/3 | 1.5–73 s | archived |
-| 9–10 | SmolVLM2 / LLaVA 1.5 7B | 0/3 | — | archived |
+| # | Model | Exact | Stable receipts | Warm median |
+|---:|---|---:|---:|---:|
+| 1 | **Qwen 3.5 4B** ← default | **9/9** | **3/3** | 0.46 s |
+| 2 | Ministral 3 3B | 6/9 | 2/3 | **0.32 s** |
+| 3 | Qwen 3.5 2B | 6/9 | 2/3 | 0.40 s |
+| 4 | Gemma 3 4B | 6/9 | 2/3 | 0.53 s |
+| 5 | MiniCPM-V 2.6 8B | 6/9 | 2/3 | 0.68 s |
+| 6 | MiniCPM-V 4.5 8B | 6/9 | 2/3 | 0.70 s |
+| 7–15 | MiniCPM-V 4.6, Qwen 3.5 0.8B, Moondream, GLM-OCR, Qwen3-VL 2B/4B, Granite, DeepSeek-OCR, Llama Vision | 0–3/9 | 0–1/3 | see report |
 
-GPU: NVIDIA RTX A2000 8 GB Laptop GPU.
+The measured run used Ollama 0.31.2, its default Flash Attention setting (`false`), f16 KV cache, and an NVIDIA RTX A2000 8 GB Laptop GPU. Three examples are a compatibility smoke test, not a production accuracy estimate.
 
 ---
 
@@ -86,7 +84,7 @@ GPU: NVIDIA RTX A2000 8 GB Laptop GPU.
 
 - Python 3.14.6
 - [ollama](https://ollama.com) running locally
-- The default model pulled: `ollama pull qwen3-vl:4b`
+- The default model pulled: `ollama pull qwen3.5:4b`
 
 ---
 
@@ -96,7 +94,7 @@ GPU: NVIDIA RTX A2000 8 GB Laptop GPU.
 git clone https://github.com/marcelpetrick/sales-slip-scanner-ng.git
 cd sales-slip-scanner-ng
 pip install -r requirements.txt
-ollama pull qwen3-vl:4b
+ollama pull qwen3.5:4b
 ```
 
 ---
@@ -104,7 +102,7 @@ ollama pull qwen3-vl:4b
 ## Usage
 
 ```bash
-# Default model (qwen3-vl:4b)
+# Default model (qwen3.5:4b)
 python salesSlipScanner.py
 
 # Override model
@@ -117,11 +115,11 @@ responses and per-file failures also produce a nonzero status.
 
 Run selected benchmark models explicitly; missing models are never downloaded
 unless `--allow-downloads` is supplied, and downloads require estimated model
-space plus a 2 GB reserve on the configured Ollama storage filesystem:
+space plus a 10 GB reserve on the configured Ollama storage filesystem:
 
 ```bash
-python localVisionModelTest/benchmark.py --model qwen3-vl:4b
-python localVisionModelTest/benchmark.py --all --allow-downloads
+python localVisionModelTest/benchmark.py --model qwen3.5:4b
+python localVisionModelTest/benchmark.py --all --runs 3 --allow-downloads --fresh
 ```
 
 ---
@@ -136,7 +134,7 @@ receipt_ocr.py                 ← shared image, prompt, parsing, and Ollama log
 localVisionModelTest/
   benchmark.py                ← explicit, capacity-checked smoke-test harness
   modelsToTest.md             ← full candidate list with VRAM / disk notes
-  results.pdf                 ← ranked archived results and per-image details
+  results.json / .md / .pdf  ← trial data, analysis, and one-page results
 documents/
   agents.md                   ← working agreement (commit style, pipeline gate)
 tests/

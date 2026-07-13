@@ -1,55 +1,31 @@
-# Vision Models to Test — Sales Slip Benchmark
+# Compact Vision Model Market Shortlist
 
-This is the historical candidate inventory used for the archived three-image
-smoke test, not a live download queue. Current runs require explicit model
-selection, and percentages from three receipts must not be interpreted as
-production accuracy.
+This is the July 2026 shortlist used by the reproducible receipt benchmark. It favors current, well-known local vision and OCR families that fit or can be attempted on an 8 GB NVIDIA GPU; model sizes are the tested Ollama artifacts rather than parameter-memory estimates.
 
-GPU target: NVIDIA RTX A2000 8GB Laptop GPU (~7.8 GB free VRAM).
-Disk: /dev/nvme0n1p1 98 GB (space-constrained — see notes below).
+| Model | Size | Why included | Measured result | Disposition |
+|---|---:|---|---:|---|
+| [Qwen 3.5 4B](https://ollama.com/library/qwen3.5) | 3.4 GB | Recent compact native vision model | 9/9 | Keep; scanner default |
+| [Ministral 3 3B](https://ollama.com/library/ministral-3) | 3.0 GB | Recent multilingual edge model | 6/9 | Keep for comparison |
+| [Qwen 3.5 2B](https://ollama.com/library/qwen3.5) | 2.7 GB | Smaller current Qwen tier | 6/9 | Keep for comparison |
+| [Gemma 3 4B](https://ollama.com/library/gemma3) | 3.3 GB | Well-known compact multimodal baseline | 6/9 | Keep for comparison |
+| [MiniCPM-V 2.6 8B](https://ollama.com/library/minicpm-v) | 5.5 GB | Established OCR-oriented vision model | 6/9 | Keep for comparison |
+| [MiniCPM-V 4.5 8B](https://ollama.com/library/minicpm-v4.5) | 6.1 GB | Newer MiniCPM vision generation | 6/9 | Keep for comparison |
+| [MiniCPM-V 4.6 1B](https://ollama.com/library/minicpm-v4.6) | 1.6 GB | Recent ultra-compact OCR candidate | 3/9 | Remove; below 50% |
+| [Qwen 3.5 0.8B](https://ollama.com/library/qwen3.5) | 1.0 GB | Smallest current Qwen vision tier | 3/9 | Remove; below 50% |
+| [GLM-OCR](https://ollama.com/library/glm-ocr) | 2.2 GB | Recent specialist document OCR model | 0/9 | Remove; output incompatible |
+| [Qwen3-VL 2B](https://ollama.com/library/qwen3-vl) | 1.9 GB | Well-known small vision-language model | 0/9 | Remove; no final content |
+| [Qwen3-VL 4B](https://ollama.com/library/qwen3-vl) | 3.3 GB | Previous project default and baseline | 0/9 | Remove; no final content |
+| [Granite 3.2 Vision 2B](https://ollama.com/library/granite3.2-vision) | 2.4 GB | IBM document-vision baseline | 0/9 | Remove; exceeds 4096 context |
+| [DeepSeek-OCR 3B](https://ollama.com/library/deepseek-ocr) | 6.7 GB | Recent OCR specialist | 0/9 | Remove; Ollama runtime error |
+| [Llama 3.2 Vision 11B](https://ollama.com/library/llama3.2-vision) | 7.8 GB | Widely used larger vision baseline | 0/9 | Remove; architecture load error |
+| [Moondream 2 1.8B](https://ollama.com/library/moondream) | 1.7 GB | Well-known tiny and fast baseline | 0/9 | Remove; format/read errors |
 
-## Tier 1 — Best Accuracy for Sales Slips (fit in 8 GB VRAM)
+## Selection decision
 
-| # | Model | Params | VRAM (Q4) | OCR Quality | Ollama command | Status |
-|---|-------|--------|-----------|-------------|----------------|--------|
-| 1 | MiniCPM-V 2.6 | 8B | ~6 GB | Excellent (5/5 invoice test) | `ollama pull minicpm-v` | queued |
-| 2 | Qwen2-VL 7B | 7B | ~6 GB | Excellent — best multilingual OCR | `ollama pull qwen2-vl:7b` | queued |
-| 3 | Llama 3.2 Vision 11B | 11B | ~8 GB | Excellent — best overall OCR | `ollama pull llama3.2-vision:11b` | queued |
-| 4 | Qwen3-VL 4B | 4B | ~6 GB | Very good (94.2% DocVQA) | `ollama pull qwen3-vl:4b` | queued |
-| 5 | olmOCR-2 7B | 7B | ~8.8 GB | SOTA documents (82.4 olmOCR-Bench) | `ollama run hf.co/richardyoung/olmOCR-2-7B-1025-GGUF` | queued (HF) |
-| 6 | Qwen2.5-VL 7B | 7B | ~6 GB | Very good for invoices | `ollama pull qwen2.5-vl:7b` | queued |
-| 7 | BakLLaVA | 7B | ~8 GB | Good for OCR / text reading | `ollama pull bakllava` | queued |
+Qwen 3.5 4B is the only model that returned all three exact totals in all three repetitions. It is also compact enough for the RTX A2000 and its 0.46-second warm median is close to the fastest tested candidates, so larger or less accurate models do not offer a useful tradeoff for this scanner.
 
-## Tier 2 — Already Downloaded (run immediately)
+## Models removed from the old queue
 
-| # | Model | Params | VRAM | Notes | Ollama command |
-|---|-------|--------|------|-------|----------------|
-| 1 | LLaVA 1.5 7B | 7B | ~6 GB | Good, well-tested baseline | `ollama pull llava:7b` |
-| 2 | Gemma 3 4B (vision) | 4B | ~3 GB | Multilingual, 35+ languages | `ollama pull gemma3:4b` |
-| 3 | LLaVA-Phi3 | ~5B | ~6 GB | Good, fast | `ollama pull llava-phi3` |
-| 4 | Moondream 2 | ~1.8B | ~2 GB | Lightweight, very fast | `ollama pull moondream` |
+The former list contained older LLaVA, BakLLaVA, Qwen2-VL, Qwen2.5-VL, SmolVLM2, German-OCR-3, MiniCPM-o, and olmOCR community tags. They were removed from this sweep because the refreshed official Ollama shortlist already spans smaller, newer general vision models and current OCR specialists while keeping the run bounded and reproducible.
 
-## Tier 3 — Tiny but Capable (priority for space-constrained systems)
-
-| # | Model | Size | VRAM | Best For | Ollama command | Status |
-|---|-------|------|------|----------|----------------|--------|
-| 1 | German-OCR-3 ⭐ | 2.7 GB | ~4–6 GB | German receipts/invoices (100% JSON validity, 0% hallucination) | `ollama pull Keyvan/german-ocr-3` | queued |
-| 2 | SmolVLM2-2.2B | 2.2B | ~4 GB | Document OCR, fast (30+ tok/s) | `ollama pull richardyoung/smolvlm2-2.2b-instruct` | queued |
-| 3 | MiniCPM-o 2.6 4B | 4B | ~5 GB | High-res images (1.8M px), excellent OCR | `ollama pull minicpm-o:4b` | queued |
-
-## Disk / VRAM Notes
-
-- olmOCR-2 requires 8.8 GB VRAM — may overflow the A2000's 8 GB; test last.
-- Llama 3.2 Vision 11B at 8 GB is borderline — use `q4_K_M` quantisation.
-- **Disk is space-constrained** (~20 GB initially, consumed quickly by Tier 2 downloads).
-  To free space for Tier 1/3 models, consider removing non-vision models:
-  ```
-  ollama rm qwen3.6:27b-q4_K_M   # frees 17 GB
-  ```
-- Download models one at a time and run benchmark incrementally if disk is tight.
-
-## Benchmark Order (recommended)
-
-Run Tier 2 first (already present), then Tier 3 (small, high value for German text),
-then Tier 1 in ascending VRAM order: Qwen3-VL 4B → Qwen2.5-VL 7B → Qwen2-VL 7B →
-MiniCPM-V → BakLLaVA → Llama 3.2 Vision → olmOCR-2.
+The full methodology, trial responses, timings, errors, digests, and deletion log are in [`results.md`](results.md) and [`results.json`](results.json). The three-receipt set is a smoke test only and must not be presented as production accuracy.
