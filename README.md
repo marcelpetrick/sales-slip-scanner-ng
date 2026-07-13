@@ -4,12 +4,15 @@
 
 The application runs entirely against a local Ollama server. It sends no receipt data to a cloud service, requires no API key, and uses `qwen3.5:4b`, the winner of the repository's Ollama 0.31.2 benchmark.
 
-**Author:** Marcel Petrick <mail@marcelpetrick.it><br>
-**License:** GPLv3 or later; see `LICENSE`.
+**Author: Marcel Petrick <mail@marcelpetrick.it>**
+
+**Note: projected is generated with AI.**
+
+**License: GPLv3 or later. See `LICENSE`.**
 
 ## Project history
 
-- **2024:** the first proof of concept sent receipt images to a remote vision API and renamed files with the detected amount.
+- **2024:** the first proof of concept sent receipt images to a remote vision API and renamed files with the detected amount. See [old project](https://github.com/marcelpetrick/codingWithGPT/tree/master/SalesSlipScanner).
 - **Early 2026:** the application moved fully to local Ollama vision models, gained strict price parsing, safe state, and an offline quality pipeline.
 - **July 2026:** a fresh Ollama 0.31.2 sweep benchmarked 15 compact models over 135 trials. Qwen 3.5 4B was the only 9/9 model.
 - **Current:** the rename workflow is gone. The application is a non-destructive hot-folder processor that produces a cumulative Markdown expense report.
