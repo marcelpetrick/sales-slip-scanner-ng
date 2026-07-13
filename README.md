@@ -43,11 +43,24 @@ Requirements are Python 3.14.6 and a running local [Ollama](https://ollama.com) 
 ```bash
 git clone https://github.com/marcelpetrick/sales-slip-scanner-ng.git
 cd sales-slip-scanner-ng
-./localPipeline.sh
 ollama pull qwen3.5:4b
+./localPipeline.sh
 ```
 
-`pyproject.toml` is the sole dependency and build definition. The pipeline creates or reuses `.venv`, installs the project with its pinned development dependencies, and runs every quality gate; no separate `requirements.txt` is needed.
+`pyproject.toml` is the sole dependency and build definition. The pipeline creates or reuses `.venv`, installs the project with its pinned development dependencies, and runs every quality gate; no separate `requirements.txt` is needed. As its final local step, it processes the existing `test_images/slip2_1093.jpg` fixture through the real Ollama server and verifies the expected `10,93 €` result.
+
+GitHub Actions cannot access the local Ollama server or GPU, so that one live stage is reported as `SKIP` when `GITHUB_ACTIONS=true`; linting and offline tests still run normally. A successful local run ends with:
+
+```text
+========== Local Pipeline Summary ==========
+Python           : PASS 3.14.6
+Virtualenv       : PASS .venv is available
+Dependencies     : PASS pyproject.toml installed
+Ruff             : PASS 0 violations
+Tests+Coverage   : PASS 38 passed in 0.31s; 97% coverage
+Ollama smoke     : PASS slip2_1093.jpg -> 10,93 €
+============================================
+```
 
 ## Run the hot folder
 
@@ -148,4 +161,4 @@ localPipeline.sh              dependency, lint, test, and coverage gate
 ./localPipeline.sh
 ```
 
-The pipeline verifies Python 3.14.6, exact dependency pins, repository-wide Ruff checks, pytest, and coverage. It always finishes with a stage-by-stage summary.
+The pipeline verifies Python 3.14.6, exact dependency pins, repository-wide Ruff checks, pytest, coverage, and one real local Ollama extraction. It always finishes with the stage-by-stage summary shown above.

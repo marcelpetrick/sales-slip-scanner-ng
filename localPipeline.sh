@@ -20,6 +20,7 @@ PYTHON_OK=0
 INSTALL_OK=0
 LINT_OK=0
 TESTS_OK=0
+OLLAMA_SMOKE_OK=0
 
 log() {
     printf '[INFO] %s\n' "$*"
@@ -68,6 +69,35 @@ extract_test_details() {
         printf '%s\n' "${result_line}"
     else
         printf '%s\n' "see pytest output"
+    fi
+}
+
+run_ollama_smoke_test() {
+    local smoke_dir="${PIPELINE_LOG_DIR}/ollama-smoke"
+    local source_image="${ROOT_DIR}/test_images/slip2_1093.jpg"
+    local expected_row='| slip2_1093.jpg | 10,93 € |'
+    local report="${smoke_dir}/receipt-report.md"
+    local model="${RECEIPT_MODEL:-qwen3.5:4b}"
+
+    [[ -f "${source_image}" ]] || {
+        error "Smoke-test fixture is missing: ${source_image}"
+        return 1
+    }
+
+    mkdir -p "${smoke_dir}"
+    cp "${source_image}" "${smoke_dir}/"
+
+    if ! run_with_log "${PIPELINE_LOG_DIR}/ollama-smoke.log" \
+        env RECEIPT_MODEL="${model}" \
+        "${ROOT_DIR}/scanHotFolder.sh" \
+        --hot-folder "${smoke_dir}" \
+        --report "${report}"; then
+        return 1
+    fi
+
+    if ! grep -Fq "${expected_row}" "${report}"; then
+        error "Ollama smoke test did not extract the expected 10,93 € amount."
+        return 1
     fi
 }
 
@@ -170,8 +200,24 @@ main() {
         mark_result "Tests+Coverage" "SKIP" "Dependencies are unavailable"
     fi
 
+    if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
+        OLLAMA_SMOKE_OK=1
+        mark_result "Ollama smoke" "SKIP" "local-only stage"
+    elif [[ "${PYTHON_OK}" -eq 1 && "${VENV_OK}" -eq 1 && "${INSTALL_OK}" -eq 1 && \
+            "${LINT_OK}" -eq 1 && "${TESTS_OK}" -eq 1 ]]; then
+        log "Running the final local Ollama smoke test with test_images/slip2_1093.jpg."
+        if run_ollama_smoke_test; then
+            OLLAMA_SMOKE_OK=1
+            mark_result "Ollama smoke" "PASS" "slip2_1093.jpg -> 10,93 €"
+        else
+            mark_result "Ollama smoke" "FAIL" "see Ollama smoke-test output"
+        fi
+    else
+        mark_result "Ollama smoke" "SKIP" "earlier mandatory stage failed"
+    fi
+
     if [[ "${PYTHON_OK}" -eq 1 && "${VENV_OK}" -eq 1 && "${INSTALL_OK}" -eq 1 && \
-          "${LINT_OK}" -eq 1 && "${TESTS_OK}" -eq 1 ]]; then
+          "${LINT_OK}" -eq 1 && "${TESTS_OK}" -eq 1 && "${OLLAMA_SMOKE_OK}" -eq 1 ]]; then
         exit_code=0
         log "localPipeline.sh completed successfully"
     else
