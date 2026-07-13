@@ -33,8 +33,10 @@ command.
 from __future__ import annotations
 
 import argparse
-import re
+import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +56,9 @@ INPUT_DIR: Path = Path(__file__).parent / "input"
 
 #: Image file extensions that will be picked up.
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".gif"})
+
+#: Audit log used to distinguish scanner output from ordinary numeric filenames.
+MANIFEST_NAME: str = ".sales-slip-scanner.json"
 
 # ---------------------------------------------------------------------------
 # Ollama helpers
@@ -122,24 +127,14 @@ def load_and_encode_image(path: Path) -> str:
     return encode_image(path)
 
 
-def is_already_processed(path: Path) -> bool:
-    """Return ``True`` when the filename already carries a price suffix.
-
-    A price suffix is ``_NNN…`` (3–6 decimal digits) immediately before the
-    file extension, e.g. ``receipt_7949.jpg``.  Files matching this pattern
-    are skipped so re-runs are idempotent.
-
-    Args:
-        path: File path to inspect (only the name is examined).
-    """
-    return bool(re.search(r"_\d{3,6}\.", path.name))
-
-
-def collect_input_files(directory: Path) -> list[Path]:
+def collect_input_files(
+    directory: Path,
+    processed_names: set[str] | None = None,
+) -> list[Path]:
     """Collect all unprocessed, supported image files in *directory*.
 
-    Subdirectories are not traversed.  Files whose names already contain a
-    price suffix (see :func:`is_already_processed`) are silently skipped.
+    Subdirectories are not traversed. Files recorded in the audit manifest
+    are skipped; ordinary filenames ending in digits remain valid inputs.
 
     Args:
         directory: The directory to scan (must exist).
@@ -157,8 +152,41 @@ def collect_input_files(directory: Path) -> list[Path]:
         for p in directory.iterdir()
         if p.is_file()
         and p.suffix.lower() in SUPPORTED_EXTENSIONS
-        and not is_already_processed(p)
+        and p.name not in (processed_names or set())
     )
+
+
+def load_manifest(directory: Path) -> dict:
+    """Load and validate the directory's processing audit manifest."""
+    path = directory / MANIFEST_NAME
+    if not path.exists():
+        return {"version": 1, "receipts": []}
+    with path.open(encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    receipts = manifest.get("receipts")
+    entries_are_valid = isinstance(receipts, list) and all(
+        isinstance(entry, dict) and isinstance(entry.get("file"), str)
+        for entry in receipts
+    )
+    if manifest.get("version") != 1 or not entries_are_valid:
+        raise ValueError(f"Invalid processing manifest: {path}")
+    return manifest
+
+
+def save_manifest(directory: Path, manifest: dict) -> None:
+    """Atomically persist the processing audit manifest."""
+    target = directory / MANIFEST_NAME
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f"{MANIFEST_NAME}.", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, target)
+    except Exception:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +229,12 @@ def build_renamed_path(original: Path, price_cents: int) -> Path:
     return original.parent / f"{original.stem}_{price_cents}{original.suffix}"
 
 
+def rename_without_overwrite(original: Path, target: Path) -> None:
+    """Rename a file without ever replacing an existing destination."""
+    os.link(original, target)
+    original.unlink()
+
+
 # ---------------------------------------------------------------------------
 # Per-file processing
 # ---------------------------------------------------------------------------
@@ -231,7 +265,7 @@ def process_file(path: Path, model_id: str) -> Optional[int]:
             return None
 
         target = build_renamed_path(path, price_cents)
-        path.rename(target)
+        rename_without_overwrite(path, target)
         euro = price_cents // 100
         cent = price_cents % 100
         print(f"OK  →  {target.name}  ({euro},{cent:02d} €)")
@@ -273,7 +307,9 @@ def run(
     """
     ensure_model_available(model_id)
 
-    files = collect_input_files(input_dir)
+    manifest = load_manifest(input_dir)
+    processed_names = {entry["file"] for entry in manifest["receipts"]}
+    files = collect_input_files(input_dir, processed_names)
     if not files:
         print(f"No unprocessed image files found in: {input_dir}/")
         return {"processed": 0, "skipped": 0, "total_cents": 0, "results": []}
@@ -284,6 +320,15 @@ def run(
     for f in files:
         price = process_file(f, model_id)
         results.append({"file": f.name, "price_cents": price})
+        if price is not None:
+            target = build_renamed_path(f, price)
+            manifest["receipts"].append({
+                "source": f.name,
+                "file": target.name,
+                "price_cents": price,
+                "model": model_id,
+            })
+            save_manifest(input_dir, manifest)
 
     ok     = [r for r in results if r["price_cents"] is not None]
     failed = [r for r in results if r["price_cents"] is None]
@@ -335,6 +380,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def main(argv: Optional[list[str]] = None) -> int:
+    """Run the command-line workflow and return a process exit status."""
+    args = parse_args(argv)
+    summary = run(model_id=args.model)
+    return 1 if summary["skipped"] else 0
+
+
 if __name__ == "__main__":
-    _args = parse_args()
-    run(model_id=_args.model)
+    sys.exit(main())

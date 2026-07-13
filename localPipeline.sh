@@ -129,6 +129,7 @@ main() {
             --tb=short \
             -q \
             --cov=salesSlipScanner \
+            --cov=receipt_ocr \
             --cov-report=term-missing \
             --cov-report="html:${ROOT_DIR}/coverage_html" \
             --cov-fail-under=80; then

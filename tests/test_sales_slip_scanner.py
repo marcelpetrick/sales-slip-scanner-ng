@@ -127,38 +127,26 @@ class TestBuildRenamedPath:
 
 
 # ===========================================================================
-# is_already_processed
+# manifest
 # ===========================================================================
 
 
-class TestIsAlreadyProcessed:
-    def test_plain_file_is_not_processed(self):
-        assert not sss.is_already_processed(Path("receipt.jpg"))
+class TestManifest:
+    def test_missing_manifest_returns_empty_structure(self, tmp_path):
+        assert sss.load_manifest(tmp_path) == {"version": 1, "receipts": []}
 
-    def test_four_digit_suffix(self):
-        assert sss.is_already_processed(Path("receipt_7949.jpg"))
+    def test_manifest_round_trip(self, tmp_path):
+        manifest = {
+            "version": 1,
+            "receipts": [{"source": "a.jpg", "file": "a_99.jpg"}],
+        }
+        sss.save_manifest(tmp_path, manifest)
+        assert sss.load_manifest(tmp_path) == manifest
 
-    def test_three_digit_suffix(self):
-        assert sss.is_already_processed(Path("receipt_100.jpg"))
-
-    def test_five_digit_suffix(self):
-        assert sss.is_already_processed(Path("receipt_12345.jpg"))
-
-    def test_six_digit_suffix(self):
-        assert sss.is_already_processed(Path("receipt_100000.jpg"))
-
-    def test_two_digit_suffix_not_matched(self):
-        # Only 2 digits — below the 3-digit minimum, not considered processed
-        assert not sss.is_already_processed(Path("receipt_79.jpg"))
-
-    def test_alpha_suffix_not_matched(self):
-        assert not sss.is_already_processed(Path("receipt_v2.jpg"))
-
-    def test_underscore_in_stem_without_price(self):
-        assert not sss.is_already_processed(Path("my_receipt.jpg"))
-
-    def test_full_path_only_name_checked(self):
-        assert sss.is_already_processed(Path("/input/2024/slip_7949.jpg"))
+    def test_invalid_manifest_is_rejected(self, tmp_path):
+        (tmp_path / sss.MANIFEST_NAME).write_text('{"version": 2}', encoding="utf-8")
+        with pytest.raises(ValueError, match="Invalid processing manifest"):
+            sss.load_manifest(tmp_path)
 
 
 # ===========================================================================
@@ -197,14 +185,18 @@ class TestCollectInputFiles:
 
     def test_already_processed_excluded(self, tmp_path):
         make_jpeg(tmp_path / "slip_7949.jpg")
-        assert sss.collect_input_files(tmp_path) == []
+        assert sss.collect_input_files(tmp_path, {"slip_7949.jpg"}) == []
 
     def test_mix_processed_and_unprocessed(self, tmp_path):
         make_jpeg(tmp_path / "new.jpg")
         make_jpeg(tmp_path / "old_7949.jpg")
-        files = sss.collect_input_files(tmp_path)
+        files = sss.collect_input_files(tmp_path, {"old_7949.jpg"})
         assert len(files) == 1
         assert files[0].name == "new.jpg"
+
+    def test_numeric_filename_is_not_assumed_processed(self, tmp_path):
+        make_jpeg(tmp_path / "receipt_2024.jpg")
+        assert sss.collect_input_files(tmp_path) == [tmp_path / "receipt_2024.jpg"]
 
     def test_sorted_order(self, tmp_path):
         make_jpeg(tmp_path / "c.jpg")
@@ -343,6 +335,17 @@ class TestProcessFile:
         assert price is None
         assert img.exists()
 
+    def test_existing_target_is_never_replaced(self, tmp_path):
+        img = make_jpeg(tmp_path / "receipt.jpg")
+        existing = tmp_path / "receipt_7949.jpg"
+        existing.write_bytes(b"keep me")
+        with patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
+             patch("salesSlipScanner.query_ollama", return_value="79,49"):
+            price = sss.process_file(img, "model")
+        assert price is None
+        assert img.exists()
+        assert existing.read_bytes() == b"keep me"
+
     def test_correct_price_in_cents(self, tmp_path):
         img = make_jpeg(tmp_path / "slip.jpg")
         with patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
@@ -417,6 +420,18 @@ class TestRun:
         assert summary["skipped"] == 1
         assert summary["total_cents"] == 1093
 
+    def test_success_is_recorded_and_not_reprocessed(self, tmp_path):
+        make_jpeg(tmp_path / "a.jpg")
+        with self._patch_model(), \
+             patch("salesSlipScanner.load_and_encode_image", return_value="b64"), \
+             patch("salesSlipScanner.query_ollama", return_value="0,99"):
+            first = sss.run(input_dir=tmp_path)
+            second = sss.run(input_dir=tmp_path)
+        assert first["processed"] == 1
+        assert second["processed"] == 0
+        manifest = sss.load_manifest(tmp_path)
+        assert manifest["receipts"][0]["file"] == "a_99.jpg"
+
     def test_missing_input_dir_raises(self):
         missing = Path("/tmp/does_not_exist_xyzzy")
         with patch("salesSlipScanner.ollama.list", fake_ollama_list("qwen3-vl:4b")):
@@ -441,3 +456,13 @@ class TestParseArgs:
     def test_unknown_flag_exits(self):
         with pytest.raises(SystemExit):
             sss.parse_args(["--unknown-flag"])
+
+
+class TestMain:
+    def test_success_returns_zero(self):
+        with patch("salesSlipScanner.run", return_value={"skipped": 0}):
+            assert sss.main([]) == 0
+
+    def test_partial_failure_returns_nonzero(self):
+        with patch("salesSlipScanner.run", return_value={"skipped": 1}):
+            assert sss.main([]) == 1
