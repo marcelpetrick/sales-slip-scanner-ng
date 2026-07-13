@@ -53,13 +53,13 @@ class TestParsePrice:
         assert sss.parse_price("79.49") == 7949
 
     def test_euro_prefix(self):
-        assert sss.parse_price("€79,49") == 7949
+        assert sss.parse_price("€79,49") is None
 
     def test_euro_suffix_with_space(self):
-        assert sss.parse_price("79,49 €") == 7949
+        assert sss.parse_price("79,49 €") is None
 
     def test_embedded_in_sentence(self):
-        assert sss.parse_price("Summe: 28,41 EUR") == 2841
+        assert sss.parse_price("Summe: 28,41 EUR") is None
 
     def test_leading_whitespace(self):
         assert sss.parse_price("  10,93  ") == 1093
@@ -87,12 +87,10 @@ class TestParsePrice:
         assert sss.parse_price("7,4") is None
 
     def test_three_decimal_digits_not_matched(self):
-        # "7,449" — \b after \d{2} prevents matching when followed by digit
-        # first valid sub-pattern "44,9" won't match; "7,44" could match before
-        # the trailing 9 — we accept whichever first match wins
-        result = sss.parse_price("7,449")
-        # either None or some valid parse is acceptable; just must not crash
-        assert result is None or isinstance(result, int)
+        assert sss.parse_price("7,449") is None
+
+    def test_multiple_amounts_rejected(self):
+        assert sss.parse_price("12,00 79,49") is None
 
 
 # ===========================================================================

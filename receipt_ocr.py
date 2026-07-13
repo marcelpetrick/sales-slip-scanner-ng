@@ -51,8 +51,13 @@ def query_model(model_id: str, image_b64: str) -> str:
 
 
 def parse_price(raw_text: str) -> Optional[int]:
-    """Extract the first decimal amount and return it as integer euro-cents."""
-    match = re.search(r"(\d+)[,.](\d{2})\b", raw_text.strip())
+    """Parse an exact decimal-only model response as integer euro-cents.
+
+    The prompt requires a single amount, so responses containing labels,
+    currency symbols, or additional numbers are rejected instead of guessing
+    which number is the receipt total.
+    """
+    match = re.fullmatch(r"(\d+)[,.](\d{2})", raw_text.strip())
     if not match:
         return None
     return int(match.group(1)) * 100 + int(match.group(2))
