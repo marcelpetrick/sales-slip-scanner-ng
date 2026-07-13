@@ -45,6 +45,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_IMAGES_DIR = REPO_ROOT / "test_images"
 OUTPUT_PDF = Path(__file__).resolve().parent / "results.pdf"
 MIN_FREE_GB = 2.0
+ARCHIVED_RUN = "2026-06-08 · NVIDIA RTX A2000 8 GB Laptop GPU"
 
 # ---------------------------------------------------------------------------
 # Models available to benchmark. No models run unless selected on the CLI.
@@ -381,7 +382,7 @@ def build_pdf(live_results: list[ModelResult], gpu_info: str):
         "(<i>slip0_7949.jpg</i> → 79,49 €). "
         "This tiny convenience sample is not an estimate of production accuracy. "
         "Models marked <i>archived</i> were tested in an earlier run and removed from "
-        "disk afterwards.",
+        f"disk afterwards. Archived measurements: {ARCHIVED_RUN}.",
         body_s
     ))
     story.append(Spacer(1, 0.35*cm))

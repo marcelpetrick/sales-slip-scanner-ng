@@ -20,9 +20,9 @@ From the 2024-version - not right anymore - we run a local vision-model!
 
 Two years ago I built [a quick proof-of-concept](https://github.com/marcelpetrick/codingWithGPT/tree/master/SalesSlipScanner) that extracted totals from German grocery receipts by sending them to the OpenAI API. It worked — and cost me exactly **15 cents** in API credits for the test run. I wrote it in about an hour and moved on.
 
-Fast forward to 2026: local vision models have caught up. After a systematic benchmark of **10 models** on the same three test receipts, **Qwen3-VL 4B** (3.3 GB, fits comfortably in 8 GB VRAM) hits **100 % accuracy** — completely offline, zero cost per inference, zero data leaving the machine.
+Fast forward to 2026: local vision models have caught up. In a small smoke test of **10 models** on the same three receipts, **Qwen3-VL 4B** (3.3 GB) extracted all three totals correctly — completely offline, with no per-inference fee and no receipt sent to a remote service.
 
-This repository is the next generation: the same idea, fully local, properly tested, with a CI pipeline.
+This repository is the next generation: the same idea, fully local, tested, and backed by a repeatable local quality pipeline.
 
 ---
 
@@ -34,7 +34,7 @@ Drop receipt images into `input/`, run the script, and each file is renamed to i
 receipt.jpg  →  receipt_7949.jpg   (79,49 €)
 ```
 
-A summary with the grand total is printed at the end.
+A summary with the grand total is printed at the end. Successful operations are recorded in `input/.sales-slip-scanner.json`, and an existing destination is never overwritten.
 
 ---
 
@@ -64,18 +64,19 @@ Found 3 file(s)  [model: qwen3-vl:4b]
 
 ## Benchmark
 
-Ten vision models were tested on three annotated German grocery/gas receipts
+Ten vision models were smoke-tested on three annotated German grocery/gas receipts
 (ground truth encoded in the filename, e.g. `slip0_7949.jpg` = 79,49 €).
 Full results are in [`localVisionModelTest/results.pdf`](localVisionModelTest/results.pdf).
+Three examples are not enough to estimate production accuracy; the percentages below only describe exact matches in this fixed convenience sample.
 
-| # | Model | Accuracy | Avg latency | On disk |
-|---|-------|----------|-------------|---------|
-| 1 | **Qwen3-VL 4B** ← default | **100 %** | 15.3 s | ✓ 3.3 GB |
-| 2 | **Llama 3.2-Vision 11B** | **100 %** | 11.5 s | ✓ 7.9 GB |
-| 3 | Moondream 2 | 67 % | **0.3 s** | ✓ 1.7 GB |
-| 4 | MiniCPM-V 2.6 | 67 % | 5.2 s | ✓ 5.5 GB |
-| 5–8 | BakLLaVA / LLaVA-Phi3 / Gemma 3 / German-OCR-3 | 33 % | 1.5–73 s | — |
-| 9–10 | SmolVLM2 / LLaVA 1.5 7B | 0 % | — | — |
+| # | Model | Smoke-test exact matches | Avg latency | Result state |
+|---|-------|--------------------------|-------------|--------------|
+| 1 | **Llama 3.2-Vision 11B** | **3/3** | 11.5 s | archived |
+| 2 | **Qwen3-VL 4B** ← default | **3/3** | 15.3 s | archived |
+| 3 | Moondream 2 | 2/3 | **0.3 s** | archived |
+| 4 | MiniCPM-V 2.6 | 2/3 | 5.2 s | archived |
+| 5–8 | BakLLaVA / LLaVA-Phi3 / Gemma 3 / German-OCR-3 | 1/3 | 1.5–73 s | archived |
+| 9–10 | SmolVLM2 / LLaVA 1.5 7B | 0/3 | — | archived |
 
 GPU: NVIDIA RTX A2000 8 GB Laptop GPU.
 
@@ -83,7 +84,7 @@ GPU: NVIDIA RTX A2000 8 GB Laptop GPU.
 
 ## Prerequisites
 
-- Python 3.10+
+- Python 3.14.6
 - [ollama](https://ollama.com) running locally
 - The default model pulled: `ollama pull qwen3-vl:4b`
 
@@ -111,7 +112,17 @@ python salesSlipScanner.py --model llama3.2-vision:11b
 ```
 
 If the requested model is not installed, the script prints the exact
-`ollama pull` command needed and exits cleanly.
+`ollama pull` command needed and exits with a nonzero status. Ambiguous model
+responses and per-file failures also produce a nonzero status.
+
+Run selected benchmark models explicitly; missing models are never downloaded
+unless `--allow-downloads` is supplied, and downloads require estimated model
+space plus a 2 GB reserve on the configured Ollama storage filesystem:
+
+```bash
+python localVisionModelTest/benchmark.py --model qwen3-vl:4b
+python localVisionModelTest/benchmark.py --all --allow-downloads
+```
 
 ---
 
@@ -121,16 +132,19 @@ If the requested model is not installed, the script prints the exact
 input/                        ← drop receipt images here
 test_images/                  ← annotated reference images
 salesSlipScanner.py           ← main script
+receipt_ocr.py                 ← shared image, prompt, parsing, and Ollama logic
 localVisionModelTest/
-  benchmark.py                ← benchmark harness (13 models, pipeline-parallel downloads)
+  benchmark.py                ← explicit, capacity-checked smoke-test harness
   modelsToTest.md             ← full candidate list with VRAM / disk notes
-  results.pdf                 ← one-page ranked results
+  results.pdf                 ← ranked archived results and per-image details
 documents/
   agents.md                   ← working agreement (commit style, pipeline gate)
 tests/
-  test_sales_slip_scanner.py  ← 65 unit tests, 98 % line coverage
-localPipeline.sh              ← lint + tests + coverage — must pass before every commit
-requirements.txt
+  test_sales_slip_scanner.py  ← scanner and shared OCR tests
+  test_benchmark.py           ← offline benchmark scoring and safety tests
+localPipeline.sh              ← Python/dependencies/lint/tests/coverage with summary
+pyproject.toml                ← Python constraint and exact dependency pins
+requirements.txt              ← compatibility installer for project + dev dependencies
 ```
 
 ---
@@ -143,4 +157,4 @@ Run the full quality pipeline before committing:
 ./localPipeline.sh
 ```
 
-Stages: **dependency install → ruff lint → pytest (98 % coverage, 65 tests)**.
+Stages: **Python 3.14.6 check → isolated dependency install → full-tree Ruff lint → pytest with coverage**. Every run ends with a stage-by-stage PASS/FAIL/SKIP summary, including test count and total coverage.

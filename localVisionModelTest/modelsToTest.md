@@ -1,5 +1,10 @@
 # Vision Models to Test — Sales Slip Benchmark
 
+This is the historical candidate inventory used for the archived three-image
+smoke test, not a live download queue. Current runs require explicit model
+selection, and percentages from three receipts must not be interpreted as
+production accuracy.
+
 GPU target: NVIDIA RTX A2000 8GB Laptop GPU (~7.8 GB free VRAM).
 Disk: /dev/nvme0n1p1 98 GB (space-constrained — see notes below).
 
