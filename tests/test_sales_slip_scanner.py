@@ -171,6 +171,20 @@ def test_empty_markdown_report_has_zero_total():
     assert "Grand total: 0,00 €" in report
 
 
+def test_html_compare_page_links_thumbnails_and_total():
+    state = scanner.empty_state()
+    state["receipts"] = [
+        receipt("shop <one>.jpg", "a" * 64, 7949),
+        receipt("fuel.jpg", "b" * 64, 2841),
+    ]
+    with patch.object(scanner, "utc_now", return_value="NOW"):
+        page = scanner.render_html(state, scanner.DEFAULT_MODEL)
+    assert 'src="shop &lt;one&gt;.jpg"' in page
+    assert "79,49 €" in page
+    assert "Grand total: 107,90 €" in page
+    assert scanner.DEFAULT_MODEL in page
+
+
 def test_process_file_success_does_not_mutate_source(tmp_path):
     image = make_image(tmp_path / "receipt.jpg")
     original = image.read_bytes()
@@ -209,6 +223,7 @@ def test_empty_hot_folder_is_created_with_report_and_state(tmp_path):
         result = scanner.run(input_dir=hot)
     assert result["receipt_count"] == 0
     assert (hot / scanner.REPORT_NAME).exists()
+    assert (hot / scanner.HTML_NAME).exists()
     assert (hot / scanner.STATE_NAME).exists()
 
 
@@ -231,6 +246,9 @@ def test_run_processes_sequentially_and_accumulates_total(tmp_path):
     assert second.read_bytes() == second_bytes
     assert len(scanner.load_state(tmp_path)["receipts"]) == 2
     assert "Grand total: 107,90 €" in (tmp_path / scanner.REPORT_NAME).read_text()
+    html_page = (tmp_path / scanner.HTML_NAME).read_text()
+    assert "Grand total: 107,90 €" in html_page
+    assert 'src="a.jpg"' in html_page and 'src="b.jpg"' in html_page
     warm.assert_called_once_with(scanner.DEFAULT_MODEL, "20m")
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import sys
@@ -32,6 +33,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = "qwen3.5:4b"
 HOT_FOLDER = ROOT / "hot_folder"
 REPORT_NAME = "receipt-report.md"
+HTML_NAME = "compare.html"
 STATE_NAME = ".sales-slip-scanner.json"
 STATE_VERSION = 2
 KEEP_ALIVE = "10m"
@@ -214,6 +216,71 @@ def write_report(path: Path, state: dict, model_id: str) -> None:
     atomic_write(path, render_report(state, model_id))
 
 
+def render_html(state: dict, model_id: str) -> str:
+    """Render all successful receipts as a visual compare page with thumbnails."""
+    receipts = state["receipts"]
+    total = sum(item["price_cents"] for item in receipts)
+    cards = []
+    for item in receipts:
+        name = html.escape(item["file"])
+        cards.append(
+            '  <div class="card">'
+            f'<img src="{name}">'
+            '<div class="info">'
+            f'<div class="amount">{format_price(item["price_cents"])} €</div>'
+            f'<div class="fname">{name}</div>'
+            "</div></div>"
+        )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Receipt Scan Compare</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#111; color:#eee; margin:0; padding:20px; }}
+  h1 {{ font-size:1.3rem; }}
+  .meta {{ color:#aaa; margin-bottom:20px; }}
+  .grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap:16px; }}
+  .card {{ background:#1c1c1c; border:1px solid #333; border-radius:8px; overflow:hidden; }}
+  .card img {{ width:100%; display:block; cursor:zoom-in; }}
+  .card .info {{ padding:8px 10px; }}
+  .card .amount {{ font-size:1.1rem; font-weight:600; color:#7fd17f; }}
+  .card .fname {{ font-size:0.75rem; color:#999; word-break:break-all; }}
+  .total {{ margin-top:24px; font-size:1.2rem; font-weight:700; }}
+  .lightbox {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.9); z-index:10; cursor:zoom-out; align-items:center; justify-content:center; }}
+  .lightbox.open {{ display:flex; }}
+  .lightbox img {{ max-width:95vw; max-height:95vh; }}
+</style>
+</head>
+<body>
+<h1>Receipt Scan Compare</h1>
+<div class="meta">Model: {html.escape(model_id)} &middot; Generated: {utc_now()} &middot; {len(receipts)} receipts</div>
+<div class="grid">
+{chr(10).join(cards)}
+</div>
+<div class="total">Grand total: {format_price(total)} €</div>
+<div class="lightbox" id="lightbox"><img id="lightbox-img" src=""></div>
+<script>
+  const lb = document.getElementById('lightbox');
+  const lbImg = document.getElementById('lightbox-img');
+  document.querySelectorAll('.card img').forEach(img => {{
+    img.addEventListener('click', () => {{
+      lbImg.src = img.src;
+      lb.classList.add('open');
+    }});
+  }});
+  lb.addEventListener('click', () => lb.classList.remove('open'));
+</script>
+</body>
+</html>
+"""
+
+
+def write_html(path: Path, state: dict, model_id: str) -> None:
+    """Atomically publish the cumulative visual compare page."""
+    atomic_write(path, render_html(state, model_id))
+
+
 def process_file(path: Path, digest: str, model_id: str, keep_alive: str) -> dict:
     """Extract one receipt total while leaving the source image untouched."""
     print(f"  {path.name}", end=" … ", flush=True)
@@ -249,6 +316,7 @@ def run(
     input_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_path or input_dir / REPORT_NAME
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path = input_dir / HTML_NAME
     ensure_model_available(model_id)
     state = load_state(input_dir)
     processed_hashes = {item["sha256"] for item in state["receipts"]}
@@ -258,6 +326,7 @@ def run(
     if not pending:
         save_state(input_dir, state)
         write_report(report_path, state, model_id)
+        write_html(html_path, state, model_id)
         print(f"No new receipt images found in: {input_dir}")
         print(f"Report: {report_path}")
         return summary(state, [], report_path)
@@ -277,6 +346,7 @@ def run(
             state["last_failures"].append(result)
         save_state(input_dir, state)
         write_report(report_path, state, model_id)
+        write_html(html_path, state, model_id)
 
     result_summary = summary(state, current_results, report_path)
     print("\n========== Receipt Summary ==========")
@@ -285,6 +355,7 @@ def run(
     print(f"All receipts      : {result_summary['receipt_count']}")
     print(f"Grand total       : {format_price(result_summary['total_cents'])} €")
     print(f"Report            : {report_path}")
+    print(f"Compare page      : {html_path}")
     print("=====================================")
     return result_summary
 
