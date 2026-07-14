@@ -10,7 +10,13 @@ The application runs entirely against a local Ollama server. It sends no receipt
 
 **License: GPLv3 or later. See `LICENSE`.**
 
+## tl;dr Images!
+### Workflow
 ![Hot-folder pipeline schematic](media/project-impression-blueprint-schematic.gif)
+### One processing run
+![](media/execution.png)
+### HTML for comparison
+![](media/compareHtml.png)
 
 ## Project history
 
