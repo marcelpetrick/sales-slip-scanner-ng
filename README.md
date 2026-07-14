@@ -68,7 +68,7 @@ Python           : PASS 3.14.6
 Virtualenv       : PASS .venv is available
 Dependencies     : PASS pyproject.toml installed
 Ruff             : PASS 0 violations
-Tests+Coverage   : PASS 38 passed in 0.31s; 97% coverage
+Tests+Coverage   : PASS 39 passed in 0.31s; 97% coverage
 Ollama smoke     : PASS slip2_1093.jpg -> 10,93 €
 ============================================
 ```
@@ -99,6 +99,7 @@ Failed this run    : 0
 All receipts      : 3
 Grand total       : 118,83 €
 Report            : .../hot_folder/receipt-report.md
+Compare page      : .../hot_folder/compare.html
 =====================================
 ```
 
